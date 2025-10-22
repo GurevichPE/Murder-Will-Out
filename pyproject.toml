@@ -1,0 +1,19 @@
+[project]
+name = "murder-will-out"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.10.1",
+    "huggingface-hub>=0.35.3",
+    "matplotlib>=3.10.7",
+    "protobuf>=6.33.0",
+    "requests>=2.32.5",
+    "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
+    "sentencepiece>=0.2.1",
+    "torch>=2.9.0",
+    "tqdm>=4.67.1",
+    "transformers>=4.57.1",
+]

@@ -1,0 +1,540 @@
+\vspace{-10pt}
+\begin{abstract}
+
+This work presents a framework for assessing whether large language models (LLMs) encode more factual knowledge in their parameters than what they express 
+in their outputs. 
+While a few studies hint at this possibility, none have clearly defined or demonstrated this phenomenon.
+We first propose a formal definition of \textit{knowledge}, quantifying it for a given question as the fraction of correct-incorrect answer pairs where the correct one is ranked higher.
+This gives rise to \textit{external} and \textit{internal} knowledge, depending on the information used to score individual answer candidates: either the model’s observable token-level probabilities or its intermediate computations.
+Hidden knowledge arises when internal knowledge exceeds external knowledge.
+We then present a case study, applying this framework to three popular open-weight LLMs in a closed-book QA setup. Our results indicate that: 
+(1) LLMs consistently encode more factual knowledge internally than what they express externally, with an average relative gap of 40\%. (2) Surprisingly, some knowledge is so deeply hidden that a model can internally know an answer \textit{perfectly}, yet fail to generate it even once, despite large-scale repeated sampling of 1,000 answers. This reveals fundamental limitations in the generation capabilities of LLMs, which (3) put a practical constraint on scaling test-time compute via repeated answer sampling in closed-book QA: significant performance improvements remain \textit{inaccessible} because some answers are practically never sampled, yet if they were, we would be guaranteed to rank them first.\footnote{\url{https://github.com/zorikg/inside-out}}
+
+\end{abstract}
+
+% ====================================
+% ====================================
+% ====================================
+
+\vspace{-3pt}
+\section{Introduction}
+\vspace{-3pt}
+
+Large language models (LLMs) excel at knowledge-intensive tasks, yet fundamental questions remain open about the nature of their factual knowledge. 
+What does it mean for LLMs to know a fact? And equally important, do LLMs store more factual information in their parameters than they express in their outputs? Answering the latter question rigorously can be highly valuable: if such knowledge is stored but not used, we might be able to develop methods to surface it, improving performance and reliability. From a safety perspective, undisclosed knowledge poses risks if it unexpectedly surfaces, revealing sensitive information or producing outputs never meant to be shared. Lastly, beyond practical considerations, this question is key to advancing interpretability: if models encode more knowledge than they express in their outputs, it highlights the need to understand how this knowledge is accessed or suppressed during inference.
+
+In this work, our goal is to study whether LLMs encode more factual knowledge in their parameters than they express in their outputs, a phenomenon we refer to as \textit{hidden knowledge}. So far, prior work has only hinted at its existence \citep{DBLP:conf/iclr/BurnsYKS23,orgad2024llms}, but none have clearly defined it or the conditions required to demonstrate its existence. Consequently, our core contribution is proposing a concrete definition that provides a framework for systematically studying hidden knowledge.
+
+To define hidden knowledge we first need to define \textit{knowledge}, which is challenging since there is no well-defined notion of it for LLMs in the literature \citep{fierro2024defining}. We couple knowledge with the ability to rank correct answers above incorrect ones using a scoring method (e.g., token-level likelihood) and quantify it per-question as the fraction of (correct, incorrect) answer pairs ranked correctly (\S \ref{sec:knowledge_def}). While other possible definitions could be proposed, ours has three key advantages. First, unlike existing perspectives on LLM's knowledge \citep{fierro2024defining}, it is specified with a clear computational procedure, making it useful for empirical studies. Second, it addresses limitations in the common practice of measuring knowledge 
+% based on a single generation’s performance
+by evaluating performance of a single predicted answer
+on closed-book question-answering (QA) benchmarks \citep{LLMs_as_KG_1, SimpleQA}. Lastly, and most importantly, it is designed with the hidden knowledge research question in mind, ensuring that both the knowledge a model expresses \textit{externally} and the knowledge it encodes \textit{internally} are measured under a unified definition. To quantify knowledge for a given question, we only need a function that assigns scores to candidate answers  using information from the model. Thus, testing for hidden knowledge comes down to measuring knowledge through different scoring functions: \textit{external} ones,\footnote{The term \textit{external} may suggest elements outside the model, which is not our intention. An alternative name could be \textit{observable}. We choose to use \textit{external} since it provides a smooth reading flow in our context.} which are restricted to use only observable signals based on the model's token-level probabilities, and \textit{internal} ones, which can use intermediate computations. Specifically, we define \textit{hidden knowledge} as the existence of an internal function that ranks answers more accurately than any external function (\S \ref{sec:hidden_knowledge_def}).
+
+
+Using this framework, we design a targeted study with 1,700 closed-book QA questions. We estimate the set of (correct, incorrect) answer pairs per question using 1,000 model-generated answers, labeled for correctness by an LLM judge that compares against the ground truth \citep{SimpleQA}. 
+For \textit{internal} scoring, we train a linear classifier to predict correctness from the model's hidden representations of question-answer pairs
+\citep{hupkes2018jair,belinkov2019tacl}. 
+We then compare the \textit{internal} knowledge measured by this classifier to \textit{external} knowledge measured by popular scoring methods that use observable signals based on the model's 
+token-level probabilities. Our results strongly indicate the presence of hidden knowledge. Across three LLMs, the internal scoring method consistently measures more knowledge than any external one, with all differences statistically significant and an average relative gap of 40\%. 
+Our formal definition and framework
+lay the foundation for further study of this important phenomenon.
+
+But how deeply can knowledge be hidden? In $56\%$ of the questions, the 1,000 model-generated answers are all wrong. So we manually add the ground-truth answer from our dataset to the set of candidate answers, and analyze its impact on the model's internal knowledge scores. 
+Surprisingly, in $9\%$ of the questions, the internal scoring method scores the ground-truth answer higher than \textit{any} incorrect candidate, despite the model \textit{failing to generate it even once} across 1,000 attempts. This illustrates an extreme case of hidden knowledge: while models may occasionally generate an incorrect answer despite knowing the correct one \citep{simhi2024distinguishing}, it is highly surprising that a perfectly known correct answer is practically \textit{never} generated, even with large scale repeated sampling. This highlights a fundamental limitation in the generation process of modern LLMs, which we hope future research on decoding mechanisms will explore. 
+
+
+Lastly, we leverage our setup and findings to enhance performance in a challenging closed-book QA setting. We obtain 12\% average \textit{relative} improvement over greedy decoding by increasing test-time compute through sampling a large set of answers and selecting the top one based on our internal scoring function. This extends existing evidence on the potential of using verifiers trained on LLMs hidden states to improve performance \citep{orgad2024llms}.
+However, the more interesting insight is that there is potential for substantial gains of additional 40\% relative improvement that remain \textit{inaccessible} due to the constraints we identified in the LLM generation process: these constraints prevent some correct answers from even being sampled, yet if they were, we would be guaranteed to choose them since they would always be ranked first.
+
+
+
+To conclude, we introduce a framework for systematically evaluating the gap between the knowledge LLMs encode internally and what they express externally, and provide strong evidence of this gap across three popular LLMs. Notably, its magnitude varies significantly, e.g., Gemma \citep{team2024gemma} shows an average relative gap of 57\% but Llama \citep{dubey2024llama} only 14\%, highlighting a crucial direction for future work: understanding the reasons for these differences and developing methods to help models to surface their internal knowledge more effectively, ultimately leading to more transparent and reliable language models.
+
+% ====================================
+% ====================================
+% ====================================
+
+
+
+% \theoremstyle{definition}
+\newtheoremstyle{break}% name
+  {12pt}% Space above
+  {12pt}% Space below
+  {\itshape}% Body font
+  {}% Indent amount
+  {\bfseries}% Theorem head font
+  {.}% Punctuation after theorem head
+  {\newline}% Space after theorem head
+  {}% Theorem head spec
+\theoremstyle{break}
+\newtheorem{definition}{Definition}
+
+% ====================================
+% ====================================
+% ====================================
+\vspace{-5pt}
+\section{Hidden Knowledge}
+\label{sec:definitions}
+\vspace{-5pt}
+
+In this section, we tackle the challenge of evaluating hidden factual knowledge in LLMs,
+going beyond prior discussions
+% on the matter 
+(\S \ref{sec:related}) by proposing a formal definition.
+We focus on knowledge represented as {\small (subject, relation, object)} triplets, whose structured nature simplifies evaluation and helps control for confounding factors such as ambiguous or easily guessable answers and overlaps between training and test examples.
+We first define \textit{knowledge} (\S \ref{sec:knowledge_def}), focusing on subjects and relations with a \textit{unique} object for clarity, since the extension to multiple objects is straightforward.
+We then define the conditions under which a model is said to possess hidden factual knowledge (\S \ref{sec:hidden_knowledge_def}) and discuss how to 
+estimate hidden knowledge for a given LLM (\S \ref{sec:estimation}).
+
+\vspace{-5pt}
+\subsection{Defining Knowledge Relative to an Answer Scoring Method}
+\label{sec:knowledge_def}
+\vspace{-5pt}
+
+We consider an auto-regressive language model $M$, where the next-token distribution given a context $x$ is $P_M(\cdot \mid x)$. Given a question $q$ and an answer $a$, we denote $M$'s token-level probability of generating $a$ as $P_{\text{M}}(a \mid q)=\prod_{i=1}^{n} P_M(a_i \mid q, a_{<i})$. Throughout the paper, $M$ is prompted to answer $q$ (see \S \ref{sec:qa_prompts}),
+so $q$ actually represents $\text{Prompt}(q)$, but we omit the explicit $\text{Prompt}$ notation for brevity.
+
+
+A common approach to test if $M$ knows a fact, e.g., {\small \textit{(``Empire State Building'', location, ``NYC'')}}, is to prompt it to answer a related question, such as {\small \textit{``Where is the Empire State Building located?''}} \citep{SimpleQA}. 
+However, $M$'s outputs may vary with decoding strategy or question phrasing, making it unclear which output to evaluate. Furthermore, decoding algorithms can make locally optimal choices, leading $M$ to generate an incorrect answer despite assigning higher likelihood to correct ones, or vice versa. This raises the question of whether we can reliably infer what $M$ does or does not know based on a \textit{specific} generated answer.
+Lastly, one correct answer does not guarantee full knowledge, e.g., $M$ should know that both {\small \textit{``NYC''}} and {\small \textit{``New York City''}} are correct answers.
+To address these limitations, we propose to examine scores, such as token-level probabilities, that $M$ assigns to all plausible answer candidates. Specifically, we quantify knowledge per-question relative to the ability to score \textit{any} correct answer higher than \textit{any} plausible incorrect one, regardless of question phrasing. Since there are many possible ways to use $M$ to score an answer, we define knowledge \textit{relative to a scoring method}, which is also particularly useful for our objective of comparing between \textit{internal} parametric knowledge, and the knowledge that is expressed \textit{externally} (\S \ref{sec:hidden_knowledge_def}). 
+We focus on a question-answer structure since it simplifies the definition, but there are also alternative settings. For instance, examining the scores that $M$ assigns to \textit{claims} reflecting the relevant fact, as we discuss in detail in \S \ref{sec:qa_format}.
+
+
+
+\vspace{-5pt}
+\begin{definition}[Knowledge of a Model w.r.t a Scoring Method]
+\label{def:knowledge_degree}
+
+For a model $\mathbf{M}$ and a fact 
+% \( \mathcal{F} \) 
+represented as a 
+\emph{\text{\small (subject, relation, object)}}
+% \(\mathbf{ \text{\small (subject, relation, object)}}\) 
+triplet \(\mathbf{(s,r,o)}\), e.g., \emph{\text{\small (``France'', capital, ``Paris'')}}, we define the following sets:
+
+
+\begin{itemize}
+    \item $\mathbf{Q(s,r)}$: All paraphrases of questions about $\mathbf{o}$ based on $\mathbf{s}$ and $\mathbf{r}$.  
+    E.g., if $\mathbf{(s,r)} = $ \emph{\text{\small (``France'', capital)}}, it may include {\small{``What is the capital of France?''}}, {\small{``Which city is the capital of France?''}}, etc.  
+     
+    \item $\mathbf{\tilde{A}(o)}$: All plausible answers to \(\mathbf{Q(s,r)}\), defined as all paraphrases of entities that have the same type as $\mathbf{o}$. E.g., if \(\mathbf{o}=\)  {\small{``Paris''}},
+    it may include paraphrases of city names such as {\small{``Paris''}}, {\small{``The city of New York''}}, etc.
+
+    \item $\mathbf{A(o)} \subseteq \mathbf{\tilde{A}(o)}$: All paraphrases of $\mathbf{o}$. E.g., if \(\mathbf{o}=\)  {\small{``Paris''}}, it may include {\small{``Paris''}}, {\small{``The city of Paris''}}, etc.  
+
+    \item $\Omega(\mathbf{s,r,o}):=\mathbf{A(o)} \times \bigl[\mathbf{\tilde{A}(o)} \setminus \mathbf{A(o)}\bigr]$: All ordered pairs of a correct answer and a plausible incorrect answer to $\mathbf{Q(s,r)}$. E.g., if $\mathbf{(s,r)} = $ \emph{\text{\small (``France'', capital)}}, it may include {\small{(``Paris'', ``London'')}}, {\small{(``Paris city'', ``NYC'')}}, etc.
+
+    
+
+\end{itemize}
+
+
+
+Next, given a scoring function \( \mathbf{S_{\text{\tiny \emph{M}}}} : \mathbf{Q(s,r)} \times \mathbf{\tilde{A}(o)} \to \mathbb{R} \),
+which receives a question answer pair $\mathbf{(q,a)}$ and uses $\mathbf{M}$ to predict whether $\mathbf{a}$ is a correct answer to $\mathbf{q}$,\footnote{
+$\mathbf{S_{\text{\tiny \emph{M}}}}$ 
+accounts for the different ways to score 
+% captures the various scoring methods
+based on information from $M$. In case $\mathbf{S_{\text{\tiny \emph{M}}}}$ has parameters (e.g., if it is a probing classifier), we assume that they were not optimized using $\mathbf{(s,r,o)}$, 
+% ensuring we strictly evaluate the knowledge encoded in $\mathbf{M}$.}
+so that we strictly evaluate knowledge encoded in $\mathbf{M}$.}
+we define a per-question score $\mathbf{K}_{\mathbf{q}}(\mathbf{s,r,o}; \mathbf{S_{\text{\tiny \emph{M}}}})$ to quantify the ability to rank correct answers above plausible incorrect ones.\footnote{Since we quantify $\mathbf{K_q}$ based on answer pairs from $\Omega(\mathbf{s,r,o})$, $\mathbf{S_{\text{\tiny \emph{M}}}}$ could in theory score an \textit{implausible} answer (e.g., \textit{``\#\%''}) higher than a correct one. While it is unlikely with reasonable $\mathbf{S_{\text{\tiny \emph{M}}}}$, we can also enforce it formally. We present an extended definition that supports this scenario in \S\ref{sec:extended_knowledge_def}.} Formally:
+
+\vspace{-8pt}
+\begin{equation}
+\label{eq:K_q}
+\mathbf{K}_{\mathbf{q}}(\mathbf{s,r,o}; \mathbf{S_{\text{\tiny \emph{M}}}}) = 
+\frac{1}{|\Omega(\mathbf{s,r,o})|}
+\sum_{(\mathbf{a}, \tilde{\mathbf{a}}) \in \Omega(\mathbf{s,r,o})}
+\mathbb{I} \bigl(
+    \mathbf{S_{\text{\tiny \emph{M}}}}(\mathbf{q,a}) > \mathbf{S_{\text{\tiny \emph{M}}}}(\mathbf{q,\tilde{a}})
+\bigr)
+\end{equation}
+
+
+The overall \emph{knowledge degree} of 
+$\mathbf{M}$ for the fact $\mathbf{(s,r,o)}$ according to $\mathbf{S_{\text{\tiny \emph{M}}}}$ is then defined as:
+
+\vspace{-8pt}
+\begin{equation}
+\label{eq:K}
+\mathbf{K}(\mathbf{s,r,o}; \mathbf{S_{\text{\tiny \emph{M}}}}) =
+\frac{1}{|\mathbf{Q(s,r)}|}
+\sum_{\mathbf{q} \in \mathbf{Q(s,r)}}
+\mathbf{K}_{\mathbf{q}}(\mathbf{s,r,o}; \mathbf{S_{\text{\tiny \emph{M}}}})
+\end{equation}
+
+Finally, we define \( \mathbf{K}^\ast \) to reflect cases of perfect knowledge, where the model correctly ranks all pairs for all questions:
+
+\vspace{-10pt}
+\begin{equation}
+\label{eq:k_star}
+\mathbf{K}^\ast(\mathbf{s,r,o}; \mathbf{S_{\text{\tiny \emph{M}}}}) = \mathbb{I}\Bigl(\mathbf{K}(\mathbf{s,r,o}; \mathbf{S_{\text{\tiny \emph{M}}}}) = 1\Bigr)
+\end{equation}
+
+\end{definition}
+
+
+
+
+\vspace{-15pt}
+% Lastly, w
+We note that $\mathbf{K_q}$ is conceptually related to the area under the ROC curve (AUC-ROC), as one interpretation of AUC-ROC is the probability that a randomly chosen positive instance is ranked higher than a randomly chosen negative one \citep{Hanley1982,fawcett2006prl}. One difference is that AUC-ROC averages over continuous thresholds, whereas our approach relies on direct pairwise comparisons, which also offers an intuitive interpretation of $\mathbf{K_q}$ as the fraction of correctly ranked answer pairs. More importantly, AUC-ROC is typically calculated across examples in a dataset, whereas $\mathbf{K_q}$ is computed separately \textit{for each question}. This distinction is significant, as scoring methods' performance can vary substantially when comparing answers to the same question, as opposed to scoring question-answer pairs independently \citep{taubenfeld2025confidence}.
+
+% in a setup where answers for a specific question are scored versus one where across multiple deferent questions \citep{taubenfeld2025confidence}.
+
+% within a specific question's answers versus cross question settings \citep{taubenfeld2025confidence}.
+
+% scoring methods may perform quite differently when evaluated within a single question versus across multiple questions
+
+\vspace{-5pt}
+\subsection{Evidence of Hidden Knowledge}
+\label{sec:hidden_knowledge_def}
+\vspace{-5pt}
+
+
+We define hidden knowledge as cases where $M$ embeds more knowledge in its parameters than it expresses externally. To formalize this, we differentiate between \textit{internal} and \textit{external} scoring functions based on the information they use to score answer candidates. 
+\textit{External} functions are restricted to using only $M$'s observable signals based on its 
+predicted token-level probabilities, while \textit{internal} functions can leverage intermediate computations, such as hidden states. Hidden knowledge is measured by comparing the knowledge captured by internal vs. external scoring functions.
+
+\vspace{-5pt}
+\begin{definition}[Evidence of Hidden Knowledge]\label{def:mistake}
+\label{def:hidden_knowledge}
+
+Given a model \( \mathbf{M} \), let \( \mathcal{T}_{\text{\tiny \emph{M}}} \) be an internal scoring function, \( \mathcal{S}_M^E \) the set of all external scoring functions, and \( \mathcal{D} = \{ \big(\mathbf{s}_i,\mathbf{r}_i,\mathbf{o}_i\big) \}_{i=1}^n \) a dataset where each element is a unique fact.
+We say that \( \mathcal{T}_{\text{\tiny \emph{M}}} \) demonstrates that \( \mathbf{M} \) has \emph{hidden knowledge} of \( \mathcal{D} \), if \( \mathbf{M} \) has more knowledge of \( \mathcal{D} \) according to \( \mathcal{T}_{\text{\tiny \emph{M}}} \) than according to any \( \mathcal{S}_M \in \mathcal{S}_M^E \), with a margin \( \Delta \) that ensures the difference is sufficiently large to rule out insignificant variations. Formally it is defined as follows:
+
+
+
+\vspace{-5pt}
+\begin{equation}
+% \refstepcounter{equation} 
+\frac{1}{n} \sum_{i=1}^n \mathbf{K}(\mathbf{s}_i, \mathbf{r}_i, \mathbf{o}_i; \mathcal{T}_{\text{M}}) >
+\max_{S_{\text{\tiny \emph{M}}} \in \mathcal{S}_M^E} \left\{
+    \frac{1}{n} \sum_{i=1}^n \mathbf{K}(\mathbf{s}_i, \mathbf{r}_i, \mathbf{o}_i; S_{\text{\tiny \emph{M}}})
+\right\} + \Delta
+% \tag*{\normalsize (\theequation)}
+\label{eq:hidden_knowledge}
+\end{equation}
+
+\end{definition}
+
+
+\vspace{-20pt}
+\subsection{Estimation}
+\label{sec:estimation}
+
+We now discuss best practices for effective estimation of the quantities of interest, independently of the specific choices for our study (\S \ref{sec:estimation_instantiation}). 
+To evaluate hidden knowledge, we must (1) select an \textit{internal} scoring function $\mathcal{T}_{\text{\tiny \emph{M}}}$, (2) estimate the set of \textit{external} functions $\mathbf{S_{\text{\tiny \emph{M}}}^{\text{\tiny \emph{E}}}}$, (3) compute $\mathbf{K}$ for each scoring function, and (4) compare $\mathbf{K(\cdot;\mathcal{T}_{\text{\tiny \emph{M}}}})$ with $\mathbf{K(\cdot;S_{\text{\tiny \emph{M}}}})$ for any external function  $\mathbf{S}_{\text{\tiny \emph{M}}} \in \mathbf{S_{\text{\tiny \emph{M}}}^{\text{\tiny \emph{E}}}}$.
+
+
+
+\textbf{Scoring Functions.}
+For $\mathbf{S_{\text{\tiny \emph{M}}}^{\text{\tiny \emph{E}}}}$, a natural choice is the probability of generating $a$ given $q$:  
+$P_{\text{M}}(a \mid q)$. On top of that, we can then include normalizing $P_{\text{M}}(a \mid q)$ by output length \citep{wang2023selfconsistency} or different strategies to prompt $M$ to verify $a$'s correctness \citep{kadavath2022language}.  
+$\mathcal{T}_{\text{\tiny \emph{M}}}$ can exploit internal model structures, such as hidden states. 
+% attention patterns, or parameters. 
+A common choice is a probing classifier 
+\citep{hupkes2018jair,belinkov2019tacl}. 
+
+
+
+% \paragraph{$\mathbf{K(s,r,o;S_{\text{\tiny \emph{M}}}})$.}
+$\mathbf{K}.$
+To estimate $\mathbf{K(s,r,o;S_{\text{\tiny \emph{M}}}})$ we need to (1) estimate $\mathbf{Q(s,r)}$, $\mathbf{A(o)}$, and $\mathbf{\tilde{A}(o)}$, and (2) score each $(\mathbf{q},\mathbf{a}) \in \mathbf{Q(s,r)} \times \mathbf{\tilde{A}(o)}$ with $\mathbf{S}_{\text{\tiny \emph{M}}}$.
+$\mathbf{Q(s,r)}$ can be obtained from a single question $\mathbf{q \in Q(s,r)}$ by paraphrasing it. For $\mathbf{\tilde{A}(o)}$, it is typically 
+computationally infeasible to enumerate all entities from the relevant type. E.g., if $\mathbf{r}$ is \textit{``married to''}, there are approximately $\mathbf{8.2}$ \textbf{billion} people worldwide. 
+Uniformly sampling a subset of entities may lead to many trivial negatives, that are clearly incorrect and consequently easily ranked below correct answers using any $\mathbf{S}_{\text{\tiny \emph{M}}}$.
+To increase the likelihood of \textit{negative} answers that are hard for $M$, we can sample answers based on $M$'s predictions. 
+However, this introduces a risk: we may fail to sample \textit{correct} answers that are deemed unlikely by $M$ or may not sample correct answers at all. To mitigate this, we can manually include $\mathbf{o}$ (and optionally its paraphrases). Lastly, to estimate $\mathbf{A(o)} \subseteq \mathbf{\tilde{A}(o)}$, we must determine the correctness of each $\mathbf{\tilde{a}} \in \mathbf{\tilde{A}(o)}$ by comparing it to $\mathbf{o}$. Popular approaches rely on string matching but risk misclassifying answers due to paraphrasing or differences in granularity \citep{EM_1, GRANOLA}. 
+This can be mitigated by prompting an LLM to compare $\mathbf{\tilde{a}}$ to $\mathbf{o}$ \citep{SimpleQA}.
+
+% ====================================
+% ====================================
+% ====================================
+
+\vspace{-5pt}
+\section{Study Design}
+\label{sec:exp_setting}
+\vspace{-5pt}
+
+We now present the design of our study that approximates hidden knowledge according to our definition (\S \ref{sec:definitions}).
+In our main setup throughout the paper we use three popular open-weights LLMs: \textsf{Llama-3-8B-Instruct} \citep{dubey2024llama},
+\textsf{Mistral-7B-Instruct} \citep{jiang2023mistral},
+and \textsf{Gemma-2-9B-Instruct} \citep{team2024gemma}.
+To provide evidence of hidden knowledge in larger models, in \S \ref{sec:qwen} we also run the main experiment with \textsf{Qwen3-32B} \citep{yang2025qwen3}, but we use a smaller set of answers to approximate $\mathbf{\tilde{A}(o)}$ (see \S \ref{sec:estimation_instantiation}) due to compute budget limitations.
+More details on the models are in \S \ref{sec:llms}.
+
+
+
+\subsection{\texorpdfstring{Collecting the Set of Factual Triplets $\mathcal{D} = \{ (\mathbf{s}_i,\mathbf{r}_i,\mathbf{o}_i) \}_{i=1}^n$}{Collecting the Set of Factual Triplets D}}
+\label{sec:dataset}
+
+We build on \eq \citep{Entity_Questions}, as it contains triplets from Wikidata \citep{Wikidata} that were already converted into QA pairs. We categorize the relations (\Cref{tab:relations} in the appendix) to focus on ones that are (1) hard to guess and (2) have a single, unambiguous answer, making them easy to grade. Specifically, we use P26 (spouse), P176 (manufacturer), P264 (record label), and P50 (author). 
+To form the development and test sets, we use 500 questions per-relation from the \eq test split, allocating 10\% for development. The training set is based on 500 questions per-relation from the \eq train split.
+The training and development sets are used only to train the internal scoring function. Full details on the data creation process are in \S \ref{sec:data_creation} and data statistics are in \Cref{tab:dataset_statistics} in the appendix.
+
+
+\subsection{Approximating the Quantities of Interest}
+\label{sec:estimation_instantiation}
+
+
+
+$\mathbf{S_{\text{\tiny \emph{M}}}^{\text{\tiny \emph{E}}}}.$
+There are two main paradigms for \emph{external} scoring functions, which operate on the $M$'s observable token-level probabilities, we test both:
+
+% \vspace{-5pt}
+\vspace{-2.5pt}
+% \begin{itemize}[nosep]
+\begin{itemize}
+% \setlength{\itemsep}{0pt}  % Space between items
+% \setlength{\parskip}{0pt}  % Space after a paragraph
+% \setlength{\parsep}{0pt}   % Space between paragraphs within an item
+
+    \item \textbf{Production-oriented}:
+    Measure how well $M$ assigns probability mass to $a$ when prompted to answer $q$, under its autoregressive decoding process. We compute this likelihood using $M$'s token-level probability, \baselineA$ = \prod_{i=1}^{n} P(a_i \mid q, a_{<i})$, as well as its length-normalized variant \citep{brown2020nips,wang2023selfconsistency}: \baselineB$ = \left( \prod_{i=1}^{n} P(a_i \mid q, a_{<i}) \right)^{\frac{1}{n}} = \exp \left( \frac{1}{n} \sum_{i=1}^{n} \log P(a_i \mid q, a_{<i}) \right)$.
+
+
+    \item \textbf{Verification-oriented}: Estimate the likelihood of $M$ to \textit{classify} $a$ as a correct answer to $q$. This classification can be implemented either by prompting $M$ to generate verbal scores
+    % given $q$ and $a$ 
+    \citep{lin2022tmlr,tian2023emnlp}, or by prompting it to assess $a$'s correctness and inspecting the likelihood of generating the ``True'' token \citep{kadavath2022language}. We focus on the latter as it worked substantially better in early experiments.\footnote{We tested generating verbal probabilities [0-1] and scores on different scales (0-1, 1-10, 1-100), but the performance was poor in our setup. We note that verbal scores have mainly shown effectiveness in \textit{reasoning} tasks.} Formally, we use  \baselineC, defined as $P(\text{``True''} \mid q, a)$.
+\end{itemize}
+\vspace{-2.5pt}
+
+\input{figs/prob_mass_llama}
+% \paragraph{$\mathbf{\tilde{A}(o)}$ and $\mathbf{A(o)}$.} 
+% \paragraph{$\mathbf{\tilde{A}(o)}$.}
+$\mathbf{\tilde{A}(o)}.$
+To approximate the set of plausible answers 
+$\mathbf{\tilde{A}(o)}$, we (1) generate one answer with greedy decoding and (2) sample additional $1,000$ answers with a temperature of 1. \Cref{fig:probability_mass} demonstrates the diminishing returns of sampling more answers. 
+E.g., for $P50$, the last $200$ answers (beyond the first $800$) contributed only $0.003$ to the probability mass, indicating that answers obtained at this stage are either duplicates or have very low token-level probabilities. Next, (3) we add the gold answer from \eq (i.e., $\mathbf{o}$), when it was not sampled, which occurs in $64\%$ of questions on average. 
+
+% \paragraph{$\mathbf{A(o)}$.}
+$\mathbf{A(o)}.$
+The set of correct answers $\mathbf{A(o)}$ is estimated using an LLM judge that compares each answer $\tilde{a} \in \mathbf{\tilde{A}(o)}$ to $\mathbf{o}$. Technical details and a human evaluation of the judge are in \S \ref{sec:llm_judge}. We discard $\sim\!\!8\%$ of the questions where all sampled answers are correct, as they lack comparative value; alternatively, we could manually set $\mathbf{K}$ to 1.
+
+
+$\mathbf{Q(s,r)}.$ We use the original question from \eq (i.e., $\mathbf{|Q(s,r)|}=1$), avoiding paraphrasing because our experiments are already computationally expensive: they require sampling a large number of answers per question, annotating each with an LLM judge, and scoring them using three different methods. 
+% (\baselineA, \baselineC, and \baselineD).
+
+
+% \paragraph{$\boldsymbol{\Delta}$.} 
+$\boldsymbol{\Delta}.$ 
+We set the threshold
+$\Delta$ (Equation \ref{eq:hidden_knowledge}) dynamically per setup based on statistical significance by performing a paired t-test with a p-value of $0.05$.
+Technical details are in \S \ref{sec:statistic_significance}.
+
+% \paragraph{$\boldsymbol{\mathcal{T}}_{M}$.}
+$\boldsymbol{\mathcal{T}}_{M}.$ The space of possible internal functions is vast, and finding the optimal one is beyond this work's scope.
+Since our goal is to explore the \textit{existence} of hidden knowledge, demonstrating it with a single internal function is sufficient. Consequently, our results should be interpreted as a lower bound. We hope future research will build on our framework and explore more advanced techniques. We pick $\mathcal{T}_{\text{\tiny \emph{M}}}$ to be a probing classifier \citep{ettinger-etal-2016-probing,belinkov-etal-2017-neural,hupkes2018jair, belinkov2019tacl}. Specifically, our probe is a linear  classifier, trained with a logistic regression objective, that receives as input $M$'s hidden state $h_M\mathbf{(q,a)}$, obtained by encoding $q$ and $a$, and classifies $a$ as correct or incorrect. We then use its output probability, representing the likelihood that $a$ is correct, as $\mathcal{T}_{\text{\tiny \emph{M}}}$. 
+
+The probe is trained on $(q,a)$ pairs labeled for correctness. 
+We create this set based on the training split using the process described in \S \ref{sec:data_creation}. The fact that the probe is trained introduces a risk that it may rely on knowledge acquired during its own training, rather than reflecting the LLM's internal representation of truthfulness. We mitigate this through careful data curation, ensuring that the factual information present in the training set is not useful for classifying test examples. 
+Since we use QA pairs that map to simple \emph{\text{ (subject, relation, object)}} triplets, 
+we can ensure that there are no subject and object overlaps between the training and test splits, preventing the probe to learn information about test entities.
+In \S \ref{sec:memorization_eval} we also empirically verify that the factual information from the training set is not useful for classifying test examples.
+
+
+Lastly, we ensure that we train \textit{mostly} on questions for which we have high certainty that $M$ knows the answer. The intuition behind this is that we want to train the probe to distinguish between multiple answers to the \textit{same question}, so we want to ensure that when we train on a $(q,a)$ pair, $M$ encodes the information about $a$'s correctness. 
+If $M$ does not know the answer to $q$, its representations are unlikely to contain useful discriminative information about the correctness of different answers, and thus our trained probe may be less effective.
+We refer to this approach as \textit{knowledge-aware probing} and discuss it in more detail, including the risks associated with alternative choices, in \S \ref{sec:knowledge_aware_probe_more_details}. In practice, we make a relaxation and assume that if $M$ generates the correct answer via greedy decoding, it likely knows the answer. We then use this (correct) greedy answer as a positive example and obtain a negative example 
+by sampling additional responses at high temperature until an incorrect answer is found. We train probes for all layers and choose the best layer based on a development set. Full technical details are in \S \ref{sec:probe_training}.
+
+
+% ====================================
+% ====================================
+% ====================================
+
+
+\input{figs/k_and_k_star_merged}
+
+\vspace{-5pt}
+\section{Results}
+\label{sec:results}
+
+
+\subsection{Evidence of Hidden Knowledge in LLMs}
+\label{sec:hidden_knowledge}
+\vspace{-5pt}
+
+
+\Cref{fig:hidden_knowledge_full} presents the average $\mathbf{K}$ and $\mathbf{K}^\ast$ scores across all three models and four relations. Notably, across all $12$ setups, the average $\mathbf{K}$ based on the \textit{internal} scoring function is larger than based on any \textit{external} one, with all the differences being statistically significant (see \S \ref{sec:statistic_significance}).
+This is also the case for the stricter definition of full knowledge $\mathbf{K}^\ast$. 
+This provides a strong evidence of the existence of hidden knowledge in LLMs.
+The magnitude of the gap between internal and external knowledge varies substantially across models, with an average difference in $\mathbf{K}$ of $57\%$ for \textsf{Gemma} but only $14\%$ for \textsf{Llama}. This indicates that models differ in their ability to fully expose their knowledge, likely due to factors such as differences in training data, methodologies or architecture, calling for future work to explore how to better facilitate knowledge exposure.
+
+
+
+When examining the \textit{external} scoring functions, we see a clear advantage for \baselineC, as it outperforms other external functions in every setting. \baselineC also accounts for the relatively low magnitude of hidden knowledge in \textsf{Llama}, as the gap between \baselineD and the other two external functions is considerably larger. 
+This shows that LLMs can exhibit a gap between the answers they can \emph{generate}\footnote{\label{footnote:generation} Since autoregressive generation involves sampling from $M$'s token probability distribution, the likelihood assigned to $a$ given $q$ (measured by \baselineA) directly reflects how likely $M$ is to generate it. Therefore, if $M$ assigns higher \baselineA scores to correct answers than to incorrect ones, it is more likely to generate a correct answer.} with reasonable likelihood and those they can \emph{verify} as correct when prompted to do so \citep{huang2025selfimprovement,rodriguez2025rankalign}.
+% , as also observed by \citet{2024naacl}. 
+
+
+
+
+
+\vspace{-5pt}
+\subsection{LLMs Can Fail to Generate Facts They \textit{Fully} Know, Even After 1,000 Attempts}
+\label{sec:gen_vs_ver}
+\vspace{-5pt}
+
+In human cognition, the \textit{tip of the tongue} state describes inability to recall a known word \citep{BROWN1966325}. 
+Psycholinguistics distinguishes \textit{comprehension} from \textit{production}, noting that people may understand words yet fail to retrieve them \citep{treiman2003language}. Linguistic theory emphasizes that \textit{performance} (language use) may not reflect \textit{competence} (language knowledge) \citep{aec7bd17-a4c8-3578-b764-35112067fc74}. Could LLMs exhibit a similar cognitively plausible gap between retrieval mechanisms and their internal knowledge?
+
+
+
+We have shown that LLMs encode more knowledge than they express externally. We now demonstrate that some knowledge is so deeply hidden that $M$ struggles to even consider a known correct answer as a candidate during generation.
+To this end, we take a closer look at the impact of manually adding the gold answer $a_{\text{\tiny G}}$ to $\mathbf{\tilde{A}(o)}$ when it was not sampled (§\ref{sec:estimation_instantiation}). 
+In this setup, $a_{\text{\tiny G}}$ is a \textit{correct} answer that $M$ is highly \textit{unlikely to generate}, as it was not sampled after 1k attempts, allowing us to test if $M$ can know $a_{\text{\tiny G}}$ despite failing to generate it.
+\Cref{fig:force_gold_slim} compares $\mathbf{K^\ast}$ scores between using only the sampled answers as $\mathbf{\tilde{A}(o)}$ and our main setup (\S \ref{sec:hidden_knowledge}) where $a_{\text{\tiny G}}$ is manually added.
+We focus on our notion of \textit{full} knowledge $\mathbf{K^\ast}$ since we aim to show cases of perfect knowledge but failure to generate 
+% (\Cref{eq:k_star}) 
+(we report and discuss $\mathbf{K}$ scores in \S \ref{sec:force_gold_k}). 
+
+The results for \baselineA (top row) are as we would expect: adding $a_{\text{\tiny G}}$ never improves $\mathbf{K^\ast}$ scores. Any improvement would require $\mathbf{K^\ast}$ to transition from 0 to 1 for certain questions, which is highly unlikely since it will require $a_{\text{\tiny G}}$ to receive a higher score than any incorrect candidate.
+
+\input{figs/force_gold_slim}
+
+Notably, for \baselineD (bottom row), we observe considerable improvements across all setups, indicating that $\mathbf{K^\ast}$ often transitions from $0$ to $1$. 
+This happens when there were no correct answers sampled, and thus $\mathbf{K^\ast}$ was manually set to $0$, yet when $a_{\text{\tiny G}}$ was added to $\mathbf{\tilde{A}(o)}$, \baselineD ranked it higher than \textit{all} the incorrect candidates. This demonstrates an extreme case of hidden knowledge: $M$ fails to generate $a_{\text{\tiny G}}$ after $1k$ attempts,
+yet still perfectly knows that $a_{\text{\tiny G}}$ is the correct answer, as it is able to rank it higher than any incorrect candidate.
+
+To further substantiate this finding, we directly quantify cases where $M$ has perfect knowledge of a fact but is extremely unlikely to consider a correct answer during generation. We define such cases by the following conditions: (1) No correct answer was sampled after $1$k attempts, (2) \baselineA$(a^\text{G}\mid q) < 0.01$, and (3) $\mathbf{K}^\ast=1$. On average, these cases occur in $7.2\%$ of the questions, demonstrating that they are not just rare cases with negligible impact.
+This finding highlights a fundamental limitation in the generation process of LLMs. While it is expected that $M$ may occasionally generate an incorrect answer despite knowing the correct one \citep{simhi2024distinguishing}, it is highly surprising that a known correct answer is practically \textit{never} generated, not even once, even with large-scale repeated sampling. 
+This limitation holds to many popular decoding methods that use $M$’s next-token probabilities, since they are guided by the \baselineA distribution, meaning that if \baselineA is low, the chance of generating $\mathbf{a}$ remains low.
+Understanding the cause of this limitation and ways to mitigate it is an important direction for future research on decoding mechanisms.
+The solution may lie in decoding paradigms that take into account internal signals to help surface known facts, e.g., \citep{rimsky-etal-2024-steering}.
+
+
+\vspace{-6pt}
+\subsection{A Case Study}
+\label{sec:case_study}
+\input{tables/qualitative}
+\vspace{-6pt}
+
+\Cref{fig:case_study} presents a case study, comparing scores assigned to each answer $a \in \mathbf{\tilde{A}(o)}$ to the question \textit{``Which company is \textbf{Volvo B58} produced by?''}.
+Since \textit{``Volvo''} appears in the text, the question may seem easy. However, while \textit{``Volvo B58''} refers to a bus made by ``Volvo Buses'', the term \textit{``B58''} is also the name of an engine produced by ``BMW''. So the model must recognize that \textit{``B58''} refers to a Volvo bus, not the BMW engine. 
+% Perhaps the most evident observation is is that 
+It is particularly evident that
+the likelihood of \textit{generating}\textsuperscript{\ref{footnote:generation}} a correct answer, reflected by \baselineA and \baselineB, is extremely low. Interestingly, even though \baselineC is also an \textit{external} score, it ranks ``Volvo Buses'' significantly higher, demonstrating the gap discussed in \S \ref{sec:hidden_knowledge} between the ability to generate and the ability to verify correctness. However, \baselineC assigns the same score to ``Volvo Buses'' and the wrong answer ``BMW Group'', indicating that $M$ struggles to distinguish between them. Despite that, the \textit{internal} scoring function perfectly ranks the answers, providing a real example of a case where $M$ encodes the knowledge in its parameters but fails to express it externally. Lastly, the gold answer in this case is ``Volvo Buses'', but it was not generated by $M$ in all 1,000 samples; only ``Volvo'' was sampled, possibly because \textit{``Volvo''} appears in the question. This illustrates the limitations in LLMs' generation capabilities we discussed 
+in \S \ref{sec:gen_vs_ver}.
+
+This example also highlights the importance of our two key design choices. First, assessing knowledge w.r.t. to a large set of answers ensures a meaningful comparison. E.g., if we considered only ``Volvo'' and \mbox{``BMW engines''}, all methods would yield a similar ranking. Second, approximating $\mathbf{\tilde{A}(o)}$ by sampling from $M$ is very useful as it allows to automatically generate challenging candidates like ``BMW''.
+
+
+
+
+% \subsection{Enhancing QA Performance via Repeated Answer Sampling and Ranking}
+\vspace{-6pt}
+\subsection{Increasing Test-Time Compute via Repeated Answer Sampling and Ranking in Closed-Book QA}
+\vspace{-6pt}
+
+A practical implication of hidden knowledge is the potential to develop methods that better expose it, improving downstream task performance. A simple approach is to sample multiple answer candidates and select the correct one \citep{brown2024large,hassid2024the,zhao2025sample}.\footnote{It is important to stress that while higher $\mathbf{K}$ increases the chances of success under inference scaling, it does not guarantee it. In \S \ref{sec:k_vs_inference_scaling}, we include a detailed discussion on the relationship between our $\mathbf{K}$ measure and inference scaling.}
+We test its feasibility in our setup when sampling 1k answer candidates and selecting the highest-scoring one, aiming to surpass greedy decoding. \Cref{tab:answer_selection} presents the results. For brevity, we aggregate all relations per model.
+
+\input{tables/answer_selection}
+
+Notably, greedy decoding performs poorly, indicating a challenging setup, likely due to long-tail knowledge requirements. Interestingly, even with \textit{short} entity-focused answers, greedy decoding does not always select the globally optimal path, as evidenced by the improved performance when selecting answers using \baselineA. This highlights the importance of the \baselineA baseline in controlling for a major confounder: ensuring that the probe does not simply resort to selecting the answer with the highest global token-level probability. 
+% With \baselineD, we observe 
+\baselineD demonstrates
+notable relative improvements of $12\%$ on average across LLMs, providing further evidence of the potential of self-verification based on the model's hidden states to enhance downstream performance \citep{orgad2024llms}. The Oracle baseline, where a correct sampled answer is always ranked first, provides an upper bound for a perfect scoring method. The fact that it remains the highest, shows that for a considerable amount of questions, we successfully sample a correct answer but fail to identify it, which could be attributed to guessing rather than knowing \citep{yona2024keep}.
+However, the most interesting results are for \baselineD w. gold, where the gold answer $a_{\text{\tiny G}}$ is manually included if not sampled. Consistent with \S \ref{sec:gen_vs_ver}, $a_{\text{\tiny G}}$ would often be selected as the top answer if only it was sampled, which could lead to 52\% average improvement over greedy (i.e. additional 40\% compared to \baselineD).
+This result highlights a substantial potential for improving performance that remains \textit{inaccessible} due to the constraints we discovered in the LLMs' generation capabilities. A natural step for future work is to develop better sampling methods that produce high-quality and diverse candidates to boost test-time performance.
+
+
+\input{figs/Qwen3-32B} 
+
+% \vspace{-5pt}
+\subsection{Hidden Knowledge in Larger Models}
+\label{sec:qwen}
+% \vspace{-5pt}
+
+
+To make our findings reliable, we put special emphasis on sampling a large set of 1,000 answers per-question to approximate $\mathbf{\tilde{A}(o)}$ (see \S \ref{sec:estimation_instantiation}), which made our experiments computationally intensive. We use 7-9B models, which balance between model size and our compute budget. To provide initial evidence of hidden knowledge in larger models we run a smaller scale experiment with \textsf{Qwen3-32B} \citep{yang2025qwen3}, using 200 sampled answers per-question. \Cref{fig:hidden_knowledge_qwen} presents the results. 
+For all relations, both the $\mathbf{K}$ and $\mathbf{K}^\ast$ measures are consistently higher when computed using the internal scoring function compared to any external one, suggesting that the hidden knowledge phenomenon persists even when scaling the number of parameters by a factor of $\sim\!\!4$.
+The average gap in $\mathbf{K}$ for \textsf{Qwen} is $12.5\%$, compared to $14\%$, $48\%$, and $57\%$ for \textsf{Llama}, \textsf{Mistral}, and \textsf{Gemma}, respectively.
+Given that the gap for the larger \textsf{Qwen} model remains relatively close to that of the much smaller \textsf{Llama}, it remains an open question whether further scaling alone can be sufficient to reduce this gap, and which other factors affect the existence of it. Importantly, since 7–32B remains a commonly used capacity range, we argue that additional mitigation strategies beyond mere scaling up are needed to better expose model knowledge.
+
+
+% ====================================
+% ====================================
+% ====================================
+\vspace{-2pt}
+\section{Related Work}
+\label{sec:related}
+\vspace{-5pt}
+
+% \paragraph{Knowledge of LLMs.}
+\textbf{Knowledge of LLMs.}
+The factual knowledge of LLMs has been widely studied. Early work considered a model to know a fact if it correctly completed a cloze sentence (\citealp{LLMs_as_KG_1,LLMs_as_KG_5, kassner-etal-2020-pretrained}, \textit{inter alia}), or directly answered a question, either in a zero-shot setting \citep{radford2019language} or after fine-tuning \citep{roberts2020much}.
+Modern LLMs, capable of instruction following, 
+are typically directly prompted to answer questions 
+(\citealp{SimpleQA, singhal2023large, anil2023palm, dubey2024llama, LLMs_as_KG_3}, \textit{inter alia}). These efforts have largely been guided by what appears intuitively reasonable,
+without a clear definition of \emph{knowledge} \citep{fierro2024defining}. Beyond the lack of a formal definition, a key limitation in previous work is that even though studies emphasized the importance of evaluating predictions across semantically equivalent \textit{questions} \citep{elazar2021tacl,de-cao-etal-2021-editing,zheng2023emnlp}, most of them focused on evaluating a single model \textit{response}.
+As discussed in \S \ref{sec:knowledge_def}, we posit that the relative ranking of all plausible answers is important and design our definition to reflect this.
+% One thing we leave out of scope is considering related facts, for example, knowing that Paris is the capital of France may also require knowing that Paris is located in France.
+One aspect we leave out of scope is verifying related facts when measuring knowledge \citep{kassner-etal-2021-beliefbank,zhong2023emnlp,DBLP:journals/tacl/CohenBYGG24}. E.g., to conclude that a model knows that Paris is France's capital, we may also check that it knows that Paris is a city in France. We hope future research will explore corresponding extensions to our definition.
+
+
+% \paragraph{Hidden Knowledge in LLMs.} 
+\textbf{Hidden Knowledge in LLMs.}
+Findings from prior work suggest that LLMs \textit{may} encode what we define as hidden knowledge. 
+There is a growing evidence that LLMs encode \textit{truthfulness} information, enabling assessment of \textit{individual} candidate answers' correctness either via probing the model's \textit{internal} states (\citealp{DBLP:conf/iclr/BurnsYKS23, DBLP:conf/emnlp/AzariaM23,marks2024the}, \textit{inter alia}) or by prompting it directly \citep{lin2022tmlr, kadavath2022language,tian2023emnlp}, with these approaches not always agreeing \citep{liu-etal-2023-cognitive}. 
+Other studies showed that a model can be ``steered'' to answer correctly where it previously failed \citep{DBLP:conf/nips/0002PVPW23,zhang2024acl, tulchinskii2024listening, rimsky-etal-2024-steering}. \citet{turpin2023language} showed a model can be biased by its input structure towards incorrect answers about known facts, and even generate a plausible justification. \citet{gekhman-etal-2024-fine} showed that fine-tuning on new knowledge can cause hallucinations on facts that were known to the pre-trained model, raising questions about whether those facts are fully forgotten.
+Indeed, some results suggest that even when a fine-tuned model fails to recall a fact, it may still encode information about it in its representations \citep{gottesman-geva-2024-estimating,patil2024iclr}.
+These findings only hint at the existence of hidden knowledge but do not clearly define or systematically demonstrate it.
+For example, studies that show that LLMs encode truthfulness information usually test the ability to classify \emph{individual} statements as correct or incorrect. However, success in such classification could 
+stem from uncertainty representation rather than factual knowledge.
+E.g., knowing that an answer is wrong does not guarantee knowledge of the right answer. 
+Although our probe is trained in a related manner, we differ since rather than evaluating performance across a large set of individual QA pairs, we quantify the ability to correctly rank 
+all possible answer candidates \textit{for a specific question}, which is much more likely to reflect knowledge of the relevant fact.
+
+
+% \paragraph{Scaling Test-Time Compute.}
+\textbf{Scaling Test-Time Compute.}
+% Significant performance gains have been achieved by increasing inference compute
+Considerable progress has been made in improving performance by increasing inference compute  \citep{snell2024scaling, OpenAI2024O1,guo2025deepseek}. 
+A popular approach is to sample diverse responses and use verifiers to identify the correct one \citep{brown2024large,hassid2024the,zhao2025sample}.
+Most studies focus on \textit{reasoning} tasks, raising 
+the question of whether such approaches can be effective for knowledge-intensive QA with \textit{short answers}, where reasoning diversity matters less.
+\citet{orgad2024llms} provided initial evidence by using a probing classifier to select the best answer among 30 model-generated candidates. 
+We extend this evidence in a highly controlled setup facilitated by our framework and, more importantly,  show that further performance gains are possible but constrained by the model’s generation capabilities, specifically its ability to recognize the correct answer while failing to generate it as a candidate.
+
+% ====================================
+% ====================================
+% ====================================
+\vspace{-7pt}
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+\vspace{-7pt}
+
+
+We present a framework for assessing the extent to which a model encodes more factual knowledge in its parameters than it expresses in its outputs.
+It consists of a formal definition and a controlled study. Our definition of \textit{knowledge} addresses limitations of measuring it based on a single generation’s performance, and enables a unified measure of both \textit{internal} and \textit{external} knowledge, facilitating our definition of \textit{hidden knowledge}. Our results indicate that LLMs consistently exhibit hidden knowledge to varying degrees, stressing the need to understand these differences and build models that better use their knowledge, for which our framework can serve as a foundation. We also demonstrate an extreme case of hidden knowledge, where the model perfectly knows an answer but is highly unlikely to generate it even once via repeated sampling. This highlights a limitation in the LLMs' generation capabilities which puts a practical constraint on scaling test-time compute via repeated answer sampling in closed-book QA, and opens an interesting direction for future research on decoding mechanisms. 
+
+An interesting direction for future work is understanding the reasons for hidden knowledge. 
+One hypothesis is that post‑training sharpens the probability distribution, which may concentrate the probability mass on a specific answer. This may lead to a condition where correct answers that were plausible before post‑training are assigned with low likelihood by the model even though the model encodes knowledge on their correctness. Another possible reason is that post-training may emphasize style, leading the model to choose fluent but less factual answers.
+A possible mitigation could be to encourage robustness to different phrasings by exposing the model to multiple correct answers during training, which would require modifying both the dataset labels and the optimization objective to jointly learn from them. 
+Another solution may lie in adapting the model during test time using decoding methods that use internal signals to help surface known facts, e.g., \citet{rimsky-etal-2024-steering}.
+Lastly, another possible direction is to address the issue during the reinforcement learning phase by designing reward signals that prioritize factuality over style. This is a challenging goal, as we do not want to compromise the stylistic fluency that makes these models so effective.
+
+
+
+% ====================================
+% ====================================
+% ====================================
+
+
+
+\section{Limitations}
+
+A key limitation of our framework is its high computational cost. For each question and model, we must generate many candidate answers, label each candidate using an LLM judge, and then score them using multiple methods. This is also the reason we focused on 7–9B models and did not experiment with models of larger capacities.
+Another limitation (discussed in \S \ref{sec:related}) is that our definition of knowledge does not consider knowledge of related facts. For example, knowing that Paris is the capital of France may also require knowing that Paris is located in France. We choose to leave this aspect out of scope and hope future work will explore corresponding extensions to our definition. Finally, a limitation of the $\mathbf{K^\ast}$ metric, which reflects \textit{full} knowledge, is its sensitivity to labeling errors: an incorrect label assigned to a candidate answer can flip its score from 0 to 1 or vice versa. To address this issue, we put significant effort into ensuring high labeling quality by using an LLM judge, carefully designing its prompt, and performing extensive human evaluations to confirm its accuracy (see \S \ref{sec:llm_judge}). This approach shows clear improvements over the commonly adopted exact-match method. Additionally, we introduce the \textit{continuous} metric $\mathbf{K}$, which is less sensitive to labeling errors, as our main evaluation measure.
+
+
+\section{Acknowledgements}
+This research is a collaboration between the Technion and Google Research. It was supported in part by a grant from Google.
+Part of this research was also supported by Open Philanthropy and an Azrieli Foundation Early Career Faculty Fellowship and part of it was funded by the European Union (ERC, Control-LM,101165402). Views and opinions expressed are, however, those of the author(s) only and do not necessarily reflect those of the European Union or the European Research Council Executive Agency. Neither the European Union nor the granting authority can be held responsible for them.
+Hadas Orgad was supported by the Apple AIML PhD fellowship.

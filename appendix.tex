@@ -1,0 +1,562 @@
+\appendix
+\section{Appendix}
+
+
+\subsection{Data Creation Process}
+\label{sec:data_creation}
+
+As discussed in \S\ref{sec:dataset}, we build on \eq \citep{Entity_Questions}, which provides triplets from Wikidata \citep{Wikidata} that have already been converted into QA pairs. We categorize relations based on two criteria: (1) they should be difficult to guess, and (2) they should have a single, unambiguous answer, making them easier to grade. This categorization is presented in \Cref{tab:relations}.
+
+We consider a question easy to guess when the object’s entity type has a relatively small set of unique values, and when the same value can apply to multiple subjects for a given relation, making it possible to guess a more prevalent value with reasonable success. For example, guessing a capital city is easier than guessing a spouse since there are only about 200 possible capitals, compared to billions of potential individuals. Similarly, professions can be easier to guess because certain professions are more common, whereas each spouse relationship is unique to a single individual.
+
+
+
+We define a relation as well-defined if it has a single, specific answer. In contrast, some relations allow multiple levels of granularity, making them ambiguous. For instance, when specifying a location, responses may vary in detail (e.g., city, state, or country), making it less well-defined.
+
+We use P26 (spouse), P176 (manufacturer), P264 (record label), and P50 (author). While P40 (child) could also be included, answering it often relies on knowledge closely related to P26 (spouse). Given the computational expense of our experiments, we decided to exclude it to manage resources more effectively.
+
+
+\paragraph{Test and Dev Sets.} We use the test split of \eq for each of our four relations. We filter out questions with more than one gold answer and questions that contain the gold answer. We also deduplicated questions that appeared more than once.
+We then 
+sample $500$ questions from each of our four relations. Afterwards, we generate the greedy answer and sample additional 1,000 answers with a temperature of 1. To this end we prompt the model with an instruction to answer the question, as described in \S \ref{sec:qa_prompts}. Next, we label each of the sampled answers using the LLM judge as described in \S \ref{sec:llm_judge}. Some answers get labeling errors (see \S \ref{sec:llm_judge}) in which case we filter the whole question out.
+We considered filtering the answers but ultimately chose to filter entire questions instead, as answer-level filtering could introduce noise into our evaluation. Our sampled answers are intended to approximate the full set of plausible responses, and we aim to utilize this entire set when estimating knowledge.
+Finally, we reserve 10\% of the remaining questions for a developments set.
+Full statistics can be found in \Cref{tab:dataset_statistics}.
+
+
+
+\paragraph{Train set.}
+We use the train split of \eq for each of our four relations and apply the same filtering steps described above (for the test and dev sets). To ensure that there is no knowledge leakage between the train and test sets we also apply the following filtering steps: (1) Filter questions that appear in the test set. (2) For relations where the subject and object have the same entity type, e.g., P26 (``married to'') we ensure that the train subject does not appear as object in the test and vice versa.
+
+We focus on questions for which the greedy answer is correct (see \S \ref{sec:knowledge_aware_probe_more_details}). To do this, we first predict greedy answers for all examples and retain only those with an exact match to the gold answer. Using exact match allows us to avoid running the judge across the full test set, which is large. This approach is justified as our goal is to find a sufficient number of examples where the greedy answer is correct, not to exhaustively identify all such cases.
+For these selected examples, we treat the greedy answer as the positive case and sample 200 additional responses using a temperature of 2.\footnote{A higher temperature increases the likelihood of sampling incorrect answers, which can be difficult when the greedy response is already correct.} We label the sampled answers using our LLM judge and discard questions for which no incorrect answers were generated. For the remaining questions, we randomly select one incorrect answer along with the correct greedy answer for our final dataset. From this set, we randomly sample 500 questions per relation, resulting in a total of 2,000 examples.
+
+\input{tables/relations}
+
+\input{tables/data_stats}
+
+\subsection{QA Prompts}
+\label{sec:qa_prompts}
+This section describes the prompt that we used to sample answers from our evaluated LLMs.
+In designing our prompts, our goal was to instruct the model to generate plausible answers without unnecessary descriptive words while keeping the instruction natural. 
+We did not specifically optimize the prompt instructions. It is possible that a carefully crafted instruction could yield significantly better performance. Yet our goal is to sample plausible answers from the model. We iterated through several versions until we observed that the model consistently outputs entities of the correct type (e.g., a person for ``married to''). Once we reached this point, we did not observe meaningful variance in performance. The following system and user prompts were used for Llama and Mistral.
+
+System Prompt (Llama and Mistral): 
+\begin{mdframed}[backgroundcolor=blue!5, skipabove=0.5\baselineskip]
+\small
+
+\noindent Your job is to answer an entity-centric question.
+
+You need to answer with the correct entity, without any additional information.
+
+\end{mdframed}
+\vspace{0.5\baselineskip}
+
+
+User Prompt (Llama and Mistral):
+\begin{mdframed}[backgroundcolor=blue!5, skipabove=0.5\baselineskip]
+\small
+
+\noindent Here is the question. Simply reply with the correct entity. If you cannot answer for any reason, output None. But do try your best to find the correct answer.
+
+
+\verb|```|
+
+Question: \{question\}
+
+\verb|```|
+
+Just return the answer, with no text around it.
+\end{mdframed}
+\vspace{0.5\baselineskip}
+
+
+Gemma does not support a system prompt, and concatenating the system and user prompts from above did not work well enough. We ultimately used the following prompt.
+
+User Prompt (Gemma):
+\begin{mdframed}[backgroundcolor=blue!5, skipabove=0.5\baselineskip]
+\small
+
+Answer the following entity-centric question, reply with the correct entity without any additional information.
+
+\verb|```|
+
+Question: \{question\}
+
+\verb|```|
+
+Just return the answer, with no text around it.
+\end{mdframed}
+\vspace{0.5\baselineskip}
+
+
+
+
+
+
+
+\subsection{LLM Judge}
+\label{sec:llm_judge}
+
+
+We select {\textsf{Qwen2.5 14B Instruct}} \citep{yang2024qwen2}\footnote{\scriptsize \url{https://huggingface.co/Qwen/Qwen2.5-14B-Instruct}} as the grader for two reasons. First, it belongs to a different model family than the ones we evaluated. Second, it is larger. Larger models contain more factual knowledge, which can be useful for the judge task. In early experiments, we found that the performance of both zero-shot and \emph{vanilla} chain-of-thought prompting was insufficient. Therefore, we designed a \emph{program-guided chain-of-thought} prompt. Essentially, we construct a mini decision tree and prompt the LLM to follow specific steps until it reaches a verdict. Our program also includes a self-verification step, which may result in an {\texttt{error}} label. For a very small number of questions we found an issue with the gold answer, so we also let the judge verify that the gold answer has correct entity type. 
+We design the prompt per-relation with small adaptations to account for specifics of the entity type and the question format. Below is an example of our prompt for P26 (``married to''):
+
+
+
+
+\begin{mdframed}[backgroundcolor=blue!5, skipabove=0.5\baselineskip]
+\small
+I will give you a question about the spouse of a person (e.g., "Who is Umberto I of Italy married to?"), a gold answer, and a proposed answer. You need to compare the proposed answer to the gold answer and assign it one of the possible grades using the steps below.
+
+Possible grades are:
+
+A: CORRECT
+
+B: INCORRECT
+
+C: WRONG\_GOLD
+
+D: ERROR
+
+Spelling errors, synonyms, abbreviations, or hedging (e.g., "it is possible that") should not alter the grade if the person referred to in the proposed answer matches the gold answer.
+
+The steps are: 
+
+Step 1: If the gold answer does not refer to a person, output "C" and finish. Otherwise, proceed to Step 2.
+
+Step 2: If the proposed answer does not refer to a person, output "B" and finish. Otherwise, proceed to Step 3.
+
+Step 3: If the proposed answer refers to the exact same person as the gold answer, output "A" and finish. Otherwise, proceed to Step 4.
+
+Step 4: Double check that both answers reflect a person and the proposed answer refers to a different person from the gold answer. If it does, output "B". Otherwise, output "D" and finish.
+
+\verb|```|
+
+Question: \{question\}
+
+Gold answer: \{gold\_answer\}
+
+Proposed answer: \{answer\}
+
+\verb|```|
+
+Output your thinking steps. After that, finish your response with "Output:" and the letter (A or B or C or D). Do not provide any explanations.
+\end{mdframed}
+\vspace{0.5\baselineskip}
+
+
+
+To save inference calls we run the judge only when exact match is false.
+In certain instances, we observed that while the judge executes the program correctly and reaches the intended conclusion, it nonetheless produces an incorrect output. Those cases could be addressed by applying simple heuristics that checked ``step 4''. For instance if the output is ``A'' (correct), then step 4 should not contain the word ``different'', or if the output is ``B'' (wrong) then it should not contain ``refer to the same entity''.
+Eventually, this procedure lead to a very high labeling quality as we demonstrate in our human evaluation next.
+
+
+\input{tables/judge_performance}
+
+\paragraph{Estimating Judge Quality.}
+% \label{sec:judge_estimate}
+To validate the reliability of our findings, we perform a human evaluation for the performance of our LLM judge. The judge model, denoted by 
+$\mathbf{J}$, determines whether a predicted answer $\mathbf{a}$, for a factual question $\mathbf{q}$, provided by a predictive model $\mathbf{M}$ is equivalent in meaning to a gold answer $\mathbf{g}$. 
+Authors of the paper manually annotated 1,080 examples for correctness. Each example consists of the triplet $(\mathbf{q}$, $\mathbf{a}, \mathbf{g})$, along with $\mathbf{v}_J$, a predictive verdict made by $\mathbf{J}$.
+
+We categorize all evaluation examples into three distinct groups based on how closely $\mathbf{a}$ matches $\mathbf{g}$ and the verdict provided by the judge:
+\begin{itemize}
+    \item \textbf{Group 1 (Exact Match):} The predicted answer $\mathbf{a}$ exactly matches the gold answer $\mathbf{g}$.\footnote{We run a normalization process on $\mathbf{a}$ before comparing it to $\mathbf{g}$.} All these cases are automatically labeled as correct (true positives), and are not part of the $1080$ examples we manually annotate.
+
+    \item \textbf{Group 2 (Judge-Positive, Non-exact match):} The judge verdicts these answers as correct even though they do not exactly match the gold answer $\mathbf{g}$.
+
+    \item \textbf{Group 3 (Judge-Negative, Non-exact match):} The judge verdicts these answers as incorrect, and they do not exactly match the gold answer $\mathbf{g}$.
+\end{itemize}
+
+Due to significant class imbalance -- with incorrect predictions by $\mathbf{M}$ vastly outnumbering correct ones (approximately 60:1) -- random sampling would yield insufficient representations of examples with correct predicted answers. E.g., if we randomly annotate, $1000$ examples, we likely get $\sim\!\!16$ correct answers. 
+% This way, the score we get for model precision is highly noisy. 
+To address this, we employed the following sampling approach:
+\begin{itemize}
+    \item All examples from \textbf{Group 1} (exact matches) were automatically considered true positives, and also not included in our annotated set of $1,080$ examples.
+
+    \item For \textbf{Groups 2 and 3}, we sampled an equal number of cases, $540$ from each group. This $540$ examples are evenly distributed among the three predictive models and four relations (i.e., $45$ examples per model and relation).
+    
+\end{itemize}
+
+All selected examples were manually labeled for correctness. However, because our sampling strategy does not reflect the actual distribution of classes, we applied a re-weighting step after annotation to accurately represent the true proportions of Groups 2 and 3 in the complete dataset. Table~\ref{tab:group_sampling} illustrates the sampling and re-weighting clearly for relation P26:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Group} & \textbf{Sampled Size per relation} & \textbf{Actual Dataset Size} & \textbf{Est. correct $\mathbf{v}_J$} & \textbf{Est. incorrect $\mathbf{v}_J$} \\
+\midrule
+1 (Exact Match) & 669 & 669 & 669 & 0 \\
+2 (Judge-positive) & 135 & 2887 & 2757.1 & 129.9 \\
+3 (Judge-negative) & 135 & 311324 & 311324 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{An example of sampling and re-weighting approach for judge quality evaluation for relation P26.}
+\label{tab:group_sampling}
+\end{table}
+
+Consider the relation \textit{P26} as an example (Table~\ref{tab:group_sampling}). Our dataset has $669$ examples in Group 1 (exact matches), $2887$ in Group 2 (judge-positive, non-exact match), and $311324$ in Group 3 (judge-negative, non-exact match). 
+All examples from Group 1 are true positives. To estimate true positives from Group 2, we manually annotated a sampled subset of $135$ examples, finding $129$ ($95.5\%$) correct. Thus, we estimate that $0.955 \times 2887 = 2757.1$ additional examples in Group 2 are true positives. Combining these, we have an estimated total of $669 + 2757.1 = 3426.1$ true positives.
+% When we manually annotated a subset of $135$ from Group 3, we found that all were incorrect, thus we estimate (almost) all examples in this group are incorrect.
+Following this approach, we estimate the amount false-positives and false negatives. We then  compute precision, recall, accuracy, and F1-score from these re-weighted counts for each relation and report these scores. 
+
+
+We present the results in Table~\ref{tab:judge_performance}. Notably, the judge achieves very high accuracy of more  than 99\%. This is expected as most cases are  straightforward in nature, as reflected by the high accuracy of the exact match alternative. 
+Nevertheless, we look into the non-straightforward cases, where determining correctness is less obvious. To quantify the benefits of our LLM-based approach, we compare its precision and recall to the widely-used exact-match metric. 
+Exact-match has a precision of 100\% by definition, but it may suffer from low recall when it classifies paraphrases of the correct answer as incorrect.
+As seen in Table~\ref{tab:judge_performance}, our LLM judge successfully identifies many correct answers missed by the EM judge,
+achieving a notably higher recall\footnote{We note that true recall is likely slightly below 100\%. Yet our human evaluation strongly suggests that it is close to 100\%.} while maintaining a very high precision. 
+This improvement can be attributed to multiple valid formulations of a correct answer that EM fails to capture.
+Taken together, these result provide evidence of a high performance of our labeling mechanism and support the validity of our primary findings.
+
+
+\renewcommand{\arraystretch}{1.2} % Adjust row height
+
+
+% \begin{wrapfigure}{r}{0.35\textwidth} % 'r' for right, 0.5\textwidth for width
+\begin{figure}[ht]
+    \centering
+    \setlength{\tabcolsep}{7.1pt} % Adjust spacing between columns
+    % \newcolumntype{C}{>{\centering\arraybackslash}m{2.2cm}} % Centered column with fixed width
+    \newcolumntype{C}{>{\centering\arraybackslash}m{2.6cm}} % 
+    \resizebox{0.35\textwidth}{!}{ % Adjust percentage of text width
+    \begin{tabular}{|c|C|C|}
+        \cline{2-3}
+        % \multicolumn{1}{c|}{} & \cellcolor{gray!30} \textbf{$M$ Knows $a$} & \cellcolor{gray!30} \textbf{$M$ Doesn't Know $a$} \\
+        \multicolumn{1}{c|}{} & \cellcolor{gray!30} \textbf{$M$ knows the answer to $q$} & \cellcolor{gray!30} \textbf{$M$ doesn't know the answer to $q$} \\
+        \hline
+        \cellcolor{gray!30} \textbf{$a$ is correct} & \cellcolor{green!30} \textbf{(A)} Known and Correct & \cellcolor{yellow!50} \textbf{(C)} Unknown and Correct \\
+        \cline{1-3}
+        \cellcolor{gray!30} \textbf{$a$ is wrong} & \cellcolor{orange!30} \textbf{(B)} Known and Wrong & \cellcolor{cyan!30} \textbf{(D)} Unknown and Wrong \\
+        \hline
+    \end{tabular}
+
+    }
+    \captionof{table}{All possible conditions for a given question $q$ and candidate answer $a$. In knowledge-aware probing we train exclusively on categories (A) and (B) to ensure that the model ($M$) knows that the correct answer is correct and the wrong answer is wrong.} % ✅ Add caption here
+    \label{tab:knowledge-errors} % ✅ Label for referencing
+% \end{wrapfigure}
+\end{figure}
+
+% \subsection{Knowledge-aware Probe (on $M$'s hidden states)}
+\subsection{Knowledge-aware Probe (on \texorpdfstring{$M$}{M}'s hidden states)}
+\label{sec:knowledge_aware_probe_more_details}
+
+In this section, we provide an extended discussion of our intuition for training the probe on questions for which it mostly knows the answers. We primarily describe \textit{possible} risks associated with alternative choices but did not empirically validate whether these risks manifest in our specific setup. This does not affect our conclusions since, as discussed in \S \ref{sec:estimation_instantiation}, our goal is to explore the existence of hidden knowledge, and demonstrating it with a single internal function is sufficient. Further investigation of this aspect could be an interesting direction for future work.
+
+To train a probing classifier for $\mathcal{T}_{\text{\tiny \emph{M}}}$, we need a dataset of $(q,a)$ pairs labeled for correctness.
+Prior work follows two main approaches to create such a dataset. Approach (i) is to pair each question $q$ with its gold answer $a_{\text{\tiny G}}$ for positive examples and using \textit{fabricated} answers as negatives \citep{marks2024the,DBLP:conf/emnlp/AzariaM23,su2024unsupervised,rateike2023weakly,2023nips}. Since fabricated negatives are often unlikely according to $M$, this risks the probe learning $M$'s likelihood rather than correctness. To disentangle likelihood from truthfulness, we instead use plausible (model-generated) incorrect answers.
+Approach (ii) is prompting $M$ to generate answers and labeling correct and incorrect responses as positive and negative, respectively \citep{zou2023representation,orgad2024llms,snyder2024kdd,yuksekgonul2024iclr}. 
+To illustrate the risk associated with it, we note that for a given question $q$ and a candidate answer $a$, we can examine two key aspects: 
+(1) does $M$ know the answer to $q$? and 
+(2) is $a$ a correct answer to $q$?
+\Cref{tab:knowledge-errors} 
+categorizes the outcomes of all possible responses to these questions.
+Since there is considerable correlation between the correctness of the generated answer and the model's knowledge, in (ii) we are likely training the probe mostly on categories \textbf{(A)} and \textbf{(D)}.
+This may train the probe to identify whether $M$ knows an answer rather than assessing the correctness of specific answers, weakening its ability to distinguish between answers to the same question.
+Instead, we introduce \emph{knowledge-aware probing}, focusing on categories \textbf{(A)} and \textbf{(B)}.
+To approximate data from these categories, we make a relaxation and assume that if $M$ generates the correct answer via greedy decoding, it likely knows the answer.
+Thus, we focus exclusively on questions for which greedy decoding produces a correct answer. We then use this (correct) greedy answer as a positive example (A).
+To obtain a negative example (B), we induce a hallucinated response from $M$, even though it likely knows the correct answer \citep{simhi2024distinguishing}, by sampling additional responses at high temperature until an incorrect answer is found.
+
+
+\subsection{Training the Probe (on \texorpdfstring{$M$}{M}'s hidden states)}
+\label{sec:probe_training}
+
+As described in \S \ref{sec:data_creation}, we create a training set of 2,000 questions, 500 from each relation, applying multiple filtering steps to ensure no factual knowledge overlaps with the test set. We then merge these datasets and use the resulting data to train our probe. In early experiments, we also trained a separate probe for each relation, but since the conclusions were similar, we opted for a simpler approach using a single probe.
+We also examined the effect of data size. We found that the probe's performance with 250 questions per relation (1,000 total) was very close to that with 500 (2,000 total), ensuring the probe is not under-trained.
+The probe is trained with a logistic regression objective, receiving as input $M$'s hidden state $h_M(q, a)$, obtained by encoding $q$ and $a$, and classifying $a$ as correct or incorrect. To represent $a$ relative to $q$, we follow a similar procedure to that described in \S\ref{sec:P_appendix}, simulating a sequence where $M$ generates $a$ when prompted with $q$. In early experiments, we also tested the sequence from \S\ref{sec:Ptrue_appendix}, where the model is prompted to verify $a$ as the answer to $q$, but the classifier’s performance was similar in both cases.
+Finally, we use the probe’s output probability -- representing the likelihood that $a$ is correct -- as $\mathcal{T}_{\text{\tiny \emph{M}}}$. We train one probe per layer and select the layer with the best performance on the development set. We also present the per-layer performance in \Cref{fig:per-layer}. We observe that scores tend to improve and then mostly stabilize in the final two-thirds of the network, typically starting around layers 11–12 out of 32. This suggests that the upper layers encode higher-quality and more consistent representations compared to earlier layers. Interestingly, we also see that there is often a tiny drop in the last layers, which are used during decoding. However, this drop is relatively small. Apart from that, we did not observe any interesting insights from analyzing the different layers. However, it was not our focus during the research, so it is possible that we missed some interesting insights there which could be explored in future work.
+
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{figs/llama.png}
+    \caption{}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{figs/mistral.png}
+    \caption{}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{figs/gemma.png}
+    \caption{}
+  \end{subfigure}
+  \caption{Per-layer $\mathbf{K}$ scores for \textsf{Llama-3-8B-Instruct} (a), \textsf{Mistral-7B-Instruct} (b) and \textsf{Gemma-2-9B-Instruct} (c).}
+  \label{fig:per-layer}
+\end{figure}
+
+\subsection{Evaluating Memorization in the Probe}
+\label{sec:memorization_eval}
+
+
+As we discuss in \S \ref{sec:estimation_instantiation} and \S \ref{sec:data_creation}, we ensure that the factual information present in the training set is not useful for classifying test examples by careful data curation. We now complement this by  empirically verifying that the probing classifier's performance does not result from memorizing training examples.
+To this end, we compared the Probe's performance to baselines trained on alternative input representations. 
+
+We define $f(q, a)$ as the concatenation of a question $q$ and its corresponding answer $a$. In our probing setup, a classifier is trained on a hidden representation $h(f(q, a))$ extracted from the LLM.
+
+As baselines, we trained classifiers using two alternative input representations:
+
+\begin{enumerate}
+\item \textbf{TF-IDF} features derived directly from the input text, denoted as \texttt{TFIDF$(f(q,a))$}.
+\item \textbf{Embedding-based} features obtained by mean-pooling the token embeddings from the LLM's input embedding layer, denoted as \texttt{EMBED\_MEAN$(f(q,a))$}.\footnote{This specific experiment was done with Qwen3-32B, to leverage the strongest embedding among all our LLMs.}
+\end{enumerate}
+
+For each of these representations, we trained a logistic regression classifier and two fully connected neural networks with varying depths.
+The idea is simple, if the training set contains facts that are useful for answering test questions, then we should see that leaning from these examples results in a better than random performance on the  test set. 
+
+Table \ref{tab:memorization_check} summarizes the accuracy results. Classifiers trained on both TF-IDF and embedding-based representations perform around chance level on the test set.\footnote{To make interpretation easier, we balance the test labels by sampling one correct and one incorrect answer per question, resulting in a 50\% random baseline (the training set is already balanced).}
+If the train set would contain useful information, we would expect at least minor gains on the test set.
+In contrast, the probe classifier, trained on internal LLM representations, significantly outperforms these baselines. This strongly suggests that the probe's performance is driven by genuine internal knowledge representations rather than memorization of textual content from the training examples.
+
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{l l c c}
+\toprule
+\textbf{Input Representation} & \textbf{Model} & \textbf{Train Acc (\%)} & \textbf{Test Acc (\%)} \\
+\midrule
+- & Random & - & 50.0 \\
+\midrule
+TFIDF$(f(q,a))$ & Logistic Regression & 95.6 & 50.5 \\
+TFIDF$(f(q,a))$ & MLP (256, 256) & 99.9 & 50.7 \\
+TFIDF$(f(q,a))$ & MLP (512, 512, 256, 128) & 99.9 & 50.2 \\
+\midrule
+EMBED\_MEAN$(f(q,a))$ & Logistic Regression & 98.8 & 49.8 \\
+EMBED\_MEAN$(f(q,a))$ & MLP (256, 256) & 99.9 & 49.1 \\
+EMBED\_MEAN$(f(q,a))$ & MLP (512, 512, 256, 128) & 99.9 & 50.9 \\
+\midrule
+$h(f(q,a))$ & Logistic Regression & 99.9 & 64.0 \\
+\bottomrule
+\end{tabular}
+\caption{Accuracy of classifiers trained on different representations of the input $(q,a)$ pairs.}
+\label{tab:memorization_check}
+\end{table}
+
+
+
+
+
+\subsection{Statistical Significance}
+\label{sec:statistic_significance}
+
+
+In \Cref{fig:hidden_knowledge_full}, we report the outcomes of statistical significance tests comparing the $\mathbf{K}$ and $\mathbf{K^\ast}$ values obtained using our internal scoring method against the best-performing external method for each model-relation combination. To this end, we shuffle all examples in the relevant test set, split them into 50 approximately equal-sized subsets, and compute $\mathbf{K}$ and $\mathbf{K^\ast}$ for each subset. We then apply a paired-sample t-test with \(p < 0.05\). We also report statistical significance in \Cref{tab:answer_selection}, where we compare each answer selection method to the greedy decoding baseline. The same procedure is applied, but we use 200 bins since we mix all four relations together.
+
+
+
+% In \Cref{fig:hidden_knowledge_full} we report statistic significance tests outcomes where we compare the $\mathbf{K}$ and $\mathbf{K^\ast}$ values using our internal scoring method with the best perform external method for each combination of model and relation.
+% To this end, we shuffle all the examples in the relevant test set, split them up into 50 approximately equally sized subsets, and compute
+% $\mathbf{K}$ and $\mathbf{K^\ast}$ for each of them. We then apply paired-sample t-test with \(p < 0.05\). We also report statistics significance in \Cref{tab:answer_selection}, where we compare each answer selection method to the greedy decoding baseline. We do the same process as described above but use 200 bins since we mix all the four relations together.
+
+
+\subsection{External Scoring}
+\label{sec:external_scoring_appendix}
+
+% \subsubsection{\baselineA and \baselineB}
+\subsubsection{\texorpdfstring{\baselineA}{Baseline A} and \texorpdfstring{\baselineB}{Baseline B}}
+\label{sec:P_appendix}
+
+To compute \baselineA$ = \prod_{i=1}^{n} P(a_i \mid q, a_{<i})$, as well as its length-normalized variant \baselineB$ = \left( \prod_{i=1}^{n} P(a_i \mid q, a_{<i}) \right)^{\frac{1}{n}} = \exp \left( \frac{1}{n} \sum_{i=1}^{n} \log P(a_i \mid q, a_{<i}) \right)$ we need to obtain the token-level probabilities of the answer $a$ conditioned on the question: $\{ P(a_i \mid q, a_{<i}) \mid i = 1, \dots, n \}$. 
+For each answer \(a\), we use the relevant prompt from \S \ref{sec:qa_prompts} as \(q\) and construct a sequence \(S\) that simulates the generation of \(a\) given \(q\). Instead of simply concatenating \(a\) to \(q\), we ensure that all special tokens match their expected form as if the model had actually generated \(a\) following \(q\). We then perform a forward pass through the model with \(S\) as input and use the resulting logits to compute the token-level likelihoods of \(a\). 
+This procedure is particularly useful for scoring the gold answer in cases where the model did not generate it at all.
+
+
+
+
+
+\subsubsection{P(True)}
+\label{sec:Ptrue_appendix}
+
+
+We use the system and user prompts from below for Llama and Mistral, and concatenate them for Gemma. We do a forward pass with the model on the resulted input and then use the logit of the next token to compute the likelihood of ``A''. Rather than applying the softmax over the entire vocabulary, we compute it only over ``A'' and ``B''.
+
+System Prompt: 
+\begin{mdframed}[backgroundcolor=blue!5, skipabove=0.5\baselineskip]
+\small
+
+\noindent Your job is to evaluate if a proposed answer to an entity-centric question is correct.
+\end{mdframed}
+\vspace{0.5\baselineskip}
+
+
+User Prompt:
+\begin{mdframed}[backgroundcolor=blue!5, skipabove=0.5\baselineskip]
+\small
+
+\noindent Here is the question and the proposed answer.
+
+
+\verb|```|
+
+Question: \{question\}
+
+Proposed Answer: \{answer\}
+
+\verb|```|
+
+Is the proposed answer:
+
+A: CORRECT
+
+B: INCORRECT
+
+Just return the letters "A" or "B", with no text around it.
+\end{mdframed}
+\vspace{0.5\baselineskip}
+
+
+\subsection{Extended Definition of Knowledge}
+\label{sec:extended_knowledge_def}
+We now discuss the full definition of knowledge, which introduces the sanity-check expression $\gamma\bigl(\mathbf{q}; S_{\text{\tiny M}}\bigr)$ that handles \textit{``implausible''} answer candidates (ones that are not in $\mathbf{\tilde{A}(o)}$). We omitted those details from the main definition (\Cref{def:knowledge_degree}) in order to make it easier to follow. 
+
+
+
+\begin{definition}[Extension to Knowledge of a Model w.r.t a Scoring Method]
+\label{def:knowledge_degree_extended}
+
+As in \Cref{def:knowledge_degree}, we consider a model $\mathbf{M}$,
+and a fact \( \mathcal{F} \) represented as a \(\mathbf{ \text{\small (subject, relation, object)}}\) triplet \(\mathbf{(s,r,o)}\), e.g., \emph{\text{\small (``France'', capital, ``Paris'')}}.
+We also denote the vocabulary of the tokenizer used by $M$ with $\mathcal{V}$.
+
+
+
+Then, in addition to $\mathbf{Q(s,r)}$, $\mathbf{\tilde{A}(o)}$ and $\mathbf{A(o)}$, we define:
+
+
+\begin{itemize}
+    \item $\mathbf{\tilde{A}_M}$: The (infinite) set of \textit{all} possible answers that $\mathbf{M}$ can produce, formally defined as $\mathcal{V}^*$. I.e., it is equal to the set of all finite sequences that can be formed using tokens from $\mathcal{V}$. It may include phrases such as \textit{``Paris''}, \textit{``Hello''}, \textit{``\#\%''}, etc.      
+\end{itemize}
+
+
+We can then define the scoring function to be \( \mathbf{S_{\text{\tiny \emph{M}}}} : \mathbf{Q(s,r)} \times \mathbf{\tilde{A}_M} \to \mathbb{R} \) instead \( \mathbf{S_{\text{\tiny \emph{M}}}} : \mathbf{Q(s,r)} \times \mathbf{\tilde{A}(o)} \to \mathbb{R} \).
+
+Next, we define the sanity-check indicator $\gamma\bigl(\mathbf{q}; S_{\text{\tiny M}}\bigr)$ that ensures that any plausible answer is scored above any non-plausible one:
+
+\vspace{-10pt}
+\begin{equation*}
+\gamma\bigl(\mathbf{q}; S_{\text{\tiny M}}\bigr)
+\;=\;
+\mathbb{I}\Bigl(
+  \forall\,\mathbf{a} \in \mathbf{\tilde{A}(o)},\;
+  \mathbf{\hat{a}}\in \mathbf{\tilde{A}_M}\!\setminus\!\mathbf{\tilde{A}(o)}
+  % \;
+  \quad
+  S_{\text{\tiny M}}\bigl(\mathbf{q},\mathbf{a}\bigr)
+  \;>\;
+  S_{\text{\tiny M}}\bigl(\mathbf{q},\mathbf{\hat{a}}\bigr)
+\Bigr)
+\end{equation*}
+
+We then adjust the definition of the per-question score $\mathbf{K}_{\mathbf{q}}(\mathbf{s,r,o}; \mathbf{S_{\text{\tiny \emph{M}}}})$ to consider the sanity check:
+
+
+\vspace{-8pt}
+\begin{equation}
+\label{eq:K_q_full}
+\mathbf{K}_{\mathbf{q}}(\mathbf{s,r,o}; \mathbf{S_{\text{\tiny \emph{M}}}}) =
+\gamma\bigl(\mathbf{q}; S_{\text{\tiny M}}\bigr)
+\frac{1}{|\Omega(\mathbf{s,r,o})|}
+\sum_{(\mathbf{a}, \tilde{\mathbf{a}}) \in \Omega(\mathbf{s,r,o})}
+\mathbb{I} \bigl(
+    \mathbf{S_{\text{\tiny \emph{M}}}}(\mathbf{q,a}) > \mathbf{S_{\text{\tiny \emph{M}}}}(\mathbf{q,\tilde{a}})
+\bigr)
+\end{equation}
+
+
+
+
+\end{definition}
+
+
+
+We note that $\gamma(\mathbf{q}; S_{\text{\tiny M}})$ should be consistently 1 for reasonable scoring methods, but we can also verify that by creating a focused challenge set.
+
+
+
+\subsection{Choosing the LLMs For Our Study}
+\label{sec:llms}
+
+We chose the following three popular open-weight instruction-tuned LLMs for our study: \textsf{Llama-3-8B-Instruct} \citep{dubey2024llama},\footnote{\scriptsize \url{https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct}}
+\textsf{Mistral-7B-Instruct} \citep{jiang2023mistral}\footnote{\scriptsize \url{https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3}} and \textsf{Gemma-2-9B-Instruct} \citep{team2024gemma}\footnote{\scriptsize \url{https://huggingface.co/google/gemma-2-9b-it}}.
+We used the largest size that we could afford, as our experiments are compute heavy. We focus on instruct models as they are the ones that the users interact with, so the question of hidden knowledge is much more relevant to them. As 
+discussed in \S \ref{sec:qwen}, we also perform a smaller scale experiment with \textsf{Qwen3-32B} \citep{yang2025qwen3}\footnote{\scriptsize \url{https://huggingface.co/Qwen/Qwen3-32B}} to provide evidence of hidden knowledge in larger capacity LLMs.
+
+
+\input{figs/force_gold_slim_k}
+
+
+\subsection{Analysis of \texorpdfstring{$\mathbf{K}$}{K} Values When Manually Adding The Gold Answer to \texorpdfstring{$\mathbf{\tilde{A}(o)}$}{A(o)}}
+\label{sec:force_gold_k}
+
+In \Cref{fig:force_gold_slim_k} we compare the $\mathbf{K}$ values between a setup that uses only the answers that were sampled as $\mathbf{\tilde{A}(o)}$ and our main setup (used in \S \ref{sec:hidden_knowledge}) where the gold is manually added to $\mathbf{\tilde{A}(o)}$. 
+On average, in $64\%$ of the cases we do not sample the gold answer, in which case adding the gold can change $\mathbf{K}$. 
+
+If we look at \baselineA, we observe a consistent increase in $\mathbf{K}$ scores. 
+We then further analyze the nature of the examples that lead to increase in $\mathbf{K}$. In $97\%$ of those cases, not only that the gold answer $a^\text{G}$ was not sampled, but there was no other correct answer sampled, and thus $\mathbf{K}$ was manually set to $0$. Accordingly, it is rather expected that in such cases adding the gold will lead it to a ``win'', increasing $\mathbf{K}$. Yet, \Cref{fig:force_gold_slim} shows us that we never observe an increase in $\mathbf{K^\ast}$ for \baselineA. In fact, in 7 out of 12 setups we even see a decrease in $\mathbf{K^\ast}$. In \S \ref{sec:gen_vs_ver} we explain why $\mathbf{K^\ast}$ results are expected for \baselineA and we now show that some increase in $\mathbf{K}$ are also as one would expect.
+
+
+When looking at \baselineD, not only it also shows a consistently increase in $\mathbf{K}$ scores, this increase is substantially higher than for \baselineA. As discussed in \S \ref{sec:gen_vs_ver}, unlike \baselineA, \baselineD shows consistent increase in $\mathbf{K^\ast}$.
+
+\begin{figure*}[t]
+ \centering
+%   \vspace{-0.6cm}
+%  \includegraphics[width=\columnwidth]{figs/Greedy diagram.png}
+\includegraphics[width=\textwidth]{figs/answers_stats.png}
+    % \vspace{-0.9cm}
+    \caption{
+    Statistics for the number of unique answers (top) and number of unique correct answers (bottom) per-questions. For a very small number of questions we observe a significantly high number of correct answers. This reflects cases where the model failed to provide a short-form answer and added additional diverse suffixes, e.g., \textit{``Helen. This answer relates to the Greek mythology context.''}. Those cases are rare and we can either filter-out such cases with a length threshold, or leave them and require the scoring functions to score them higher than wrong ones. Both options are legitimate and we validated that they do not affect our findings. For simplicity we report results without filtering.
+    }
+    \label{fig:answers_stats}    
+    % \vspace{-0.5cm}
+\end{figure*}
+
+
+\subsection{How $\mathbf{K}$ Affects Our Chances of Success in Inference Scaling?}
+\label{sec:k_vs_inference_scaling}
+
+
+We begin with a theoretical discussion on the relationship between our definition of knowledge and inference scaling. One interpretation of $\mathbf{K}(\cdot; S_M)$ is the probability of ranking a randomly chosen correct-vs.-incorrect answers pair correctly. Let $p = \Pr_{a \sim M}[a \in A(o)]$ be the probability to sample a correct answer from $M$. Then, when drawing $n$ i.i.d. samples, the probability that the top-ranked candidate is correct is:
+
+\begin{equation}
+\Pr[\text{Success}((s, r, o); n, p, S_M)] =
+\sum_{i=0}^{n} 
+\underbrace{\binom{n}{i} p^i (1 - p)^{n-i}}_{\substack{\textcolor{blue}{\text{Probability to sample $i$}} \\ \textcolor{blue}{\text{correct and $(n{-}i)$ wrong}}}} \cdot
+\underbrace{\left[
+    1 - 
+    \overbrace{
+        \left(
+            1 - 
+            \overbrace{K(s, r, o; S_M)^{n-i}}^{\substack{\textcolor{teal}{\text{Probability that one}} \\ \textcolor{teal}{\text{correct answer out-ranks}} \\ \textcolor{teal}{\text{all $(n{-}i)$ wrong ones}}}}
+        \right)^i
+    }^{\substack{\textcolor{teal}{\text{Probability that all $i$ correct}} \\ \textcolor{teal}{\text{answers fail to out-rank all wrong ones}}}}
+\right]}_{\substack{\textcolor{blue}{\text{Probability that at least one correct}} \\ \textcolor{blue}{\text{answer out-ranks all $(n{-}i)$ wrong ones}}}}
+\end{equation}
+
+
+
+
+
+It is evident that as $\mathbf{K}$ increases, so does $\Pr[\text{Success}(K)]$. Demonstrating a practical usefulness of our definition of knowledge: the more knowledge $M$ has according to our definition, the higher is its chance to benefit from inference scaling. 
+
+That said, it is also important to note that two models may exhibit identical inference scaling behavior despite significant differences in $K$. While, in principle, higher $\mathbf{K}$ and $\mathbf{K^\ast}$ scores increase the chances of success under inference scaling, they do not guarantee it. In fact, there are cases where a model $M1$ has a higher knowledge gap than another model $M2$, yet $M2$ benefits more from inference scaling. The key intuition is that $\mathbf{K}$ scores reward robustness across multiple correct phrasings, whereas inference scaling only requires the model to rank one correct answer above all incorrect ones.
+
+To illustrate this, consider the following hypothetical example. Both $M1$ and $M2$ have the same five candidate answers: two correct $(c1, c2)$ and three incorrect $(w1, w2, w3)$. Suppose $M1$ ranks them as $(c1, w1, w2, w3, c2)$, and $M2$ as $(w1, c1, c2, w2, w3)$, where the leftmost is the top ranked answer. Under inference scaling, where the top-ranked answer is selected, $M1$ returns a correct answer ($c1$) while $M2$ returns a wrong one ($w1$). However, $M2$ achieves a higher $\mathbf{K}$ score. For $M1$ $\mathbf{K}=3/10$ due to $c1>w2$, $c1>w2$ and $c1>w3$, while for $M2$ $\mathbf{K}=4/10$ due to $c1>w2$, $c1>w3$, $c2>w2$ and $c2>w3$. This illustrates how differences in K scores do not always predict differences in inference scaling outcomes. Same holds for $\mathbf{K^\ast}$. Suppose we now have a model $M3$ that ranks the answers as $(c1, c2, w1, w2, w3)$. Both $M1$ and $M3$ will succeed under inference scaling, but only $M3$ achieves $\mathbf{K^\ast} = 1$ (as all correct answers are ranked above all incorrect ones), while $M1$ gets $\mathbf{K^\ast} = 0$ (as $c2$ is ranked below several incorrect answers). This illustrates that even $\mathbf{K^\ast}$ may not fully explain inference scaling performance.
+
+We believe that our choice to include rankings of different phrasings of the correct answer in our metric is important, even if it is not required for inference scaling. For example, a model might be used to verify responses, either in response to a user request or to generate a reward score, in which case recognizing alternative phrasings is crucial.
+
+
+\subsection{Alternatives to QA Format}
+\label{sec:qa_format}
+
+As we discuss in \S \ref{sec:knowledge_def}, we choose to work with a QA format but other alternatives exist.
+Specifically, we could 
+examine the scores that $M$ assigns to claims reflecting the relevant fact. For instance, if our fact is {\small \textit{(``Empire State Building'', location, ``NYC'')}}, then, instead of scoring alternative answers to a related question, such as {\small \textit{``Where is the Empire State Building located?''}}, we could score different claims, measuring whether correct claims (e.g., \textit{``The Empire State Building is located in NYC''}) score higher than contradicting claims (e.g., \textit{``The Empire State Building is located in Paris''}). 
+However, to ensure a meaningful comparison, claims must follow a fixed template and differ only in factual content. The QA format naturally facilitates this by providing an environment where this factor is easily controlled since we can keep the question fixed and compare alternative answers.
+
+
