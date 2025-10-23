@@ -1,6 +1,35 @@
 # Murder-Will-Out
 Final project for "Models of sequential data" course dedicated to hidden knowledge in LLMs.
 
+## Dependences installation
+
+Our project uses `uv` package manager. You can install it by
+
+```bash
+pip install uv
+```
+
+Next, to build all dependences you should run the command
+
+```bash
+uv sync
+```
+
+Finally, to run python scripts, you should do:
+
+```bash
+uv run python <script_name>
+```
+
+## Data
+
+You can find the original dataset in [EntityQuestions](https://github.com/princeton-nlp/EntityQuestions) repository, or [here](https://nlp.cs.princeton.edu/projects/entity-questions/dataset.zip), or using `wget` command:
+
+```bash
+wget https://nlp.cs.princeton.edu/projects/entity-questions/dataset.zip
+```
+
+## Code
 
 ### Data preprocessing
 
