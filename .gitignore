@@ -210,7 +210,7 @@ __marimo__/
 data/
 models/
 plots/
-
+key.py
 .tex
 
 *.pdf

@@ -6,6 +6,12 @@ This module implements the formulas for calculating knowledge metrics:
 - K: Overall knowledge degree
 - K*: Perfect knowledge indicator
 
+IMPORTANT: This module implements proper answer deduplication for K calculations.
+For correct K/K* metrics, use calculate_k_q_with_answers() which:
+1. Deduplicates answers (e.g., "Paris" appearing multiple times = 1 unique answer)
+2. Aggregates scores for duplicates (default: max score)
+3. Then calculates K on the unique answer sets
+
 References:
     Paper: arxiv 2503.15299v4
     Equation (1): K_q formula
@@ -17,6 +23,111 @@ import json
 from pathlib import Path
 from typing import List, Dict, Tuple, Union, Callable, Optional
 import numpy as np
+
+
+def deduplicate_answers_with_scores(
+    answers: List[str],
+    scores: Union[List[float], np.ndarray],
+    labels: Union[List[str], List[bool], np.ndarray],
+    aggregation_method: str = "max"
+) -> Tuple[List[str], List[float], List]:
+    """
+    Deduplicate answers and aggregate scores for unique answers.
+    
+    This is crucial for proper K calculation - we need to work with unique answer sets,
+    not individual answer instances. If "Paris" appears multiple times, we should 
+    treat it as one unique answer with aggregated score.
+    
+    Args:
+        answers: List of answer strings (may contain duplicates)
+        scores: List/array of scores corresponding to each answer
+        labels: List/array of labels corresponding to each answer 
+        aggregation_method: How to aggregate scores for duplicate answers ("max", "mean")
+        
+    Returns:
+        Tuple of (unique_answers, aggregated_scores, aggregated_labels)
+    """
+    if len(answers) != len(scores) or len(answers) != len(labels):
+        raise ValueError("answers, scores, and labels must have the same length")
+    
+    # Convert to numpy for easier handling
+    scores = np.array(scores)
+    labels = np.array(labels)
+    
+    # Group by unique answers
+    answer_groups = {}
+    for i, answer in enumerate(answers):
+        # Normalize answer for comparison (strip whitespace, lowercase)
+        normalized_answer = answer.strip().lower()
+        
+        if normalized_answer not in answer_groups:
+            answer_groups[normalized_answer] = {
+                "original_answer": answer,  # Keep original formatting
+                "scores": [],
+                "labels": []
+            }
+        
+        answer_groups[normalized_answer]["scores"].append(scores[i])
+        answer_groups[normalized_answer]["labels"].append(labels[i])
+    
+    # Aggregate scores and labels for each unique answer
+    unique_answers = []
+    aggregated_scores = []
+    aggregated_labels = []
+    
+    for normalized_answer, data in answer_groups.items():
+        unique_answers.append(data["original_answer"])
+        
+        # Aggregate scores
+        if aggregation_method == "max":
+            agg_score = np.max(data["scores"])
+        elif aggregation_method == "mean":
+            agg_score = np.mean(data["scores"])
+        else:
+            raise ValueError(f"Unknown aggregation method: {aggregation_method}")
+        
+        aggregated_scores.append(agg_score)
+        
+        # For labels, if any instance is correct, consider the unique answer correct
+        # This handles cases where the same answer might have inconsistent labels
+        answer_labels = data["labels"]
+        if any(label in ["EXACT_MATCH", "True", True] for label in answer_labels):
+            aggregated_labels.append("EXACT_MATCH")  # Use consistent correct label
+        else:
+            aggregated_labels.append("False")  # Use consistent incorrect label
+    
+    return unique_answers, aggregated_scores, aggregated_labels
+
+
+def calculate_k_q_with_answers(
+    answers: List[str],
+    scores: Union[List[float], np.ndarray],
+    labels: Union[List[str], List[bool], np.ndarray],
+    aggregation_method: str = "max"
+) -> float:
+    """
+    Calculate K_q with proper answer deduplication.
+    
+    This is the correct way to calculate K_q - first deduplicate answers,
+    then calculate K on the unique answer sets.
+    
+    Args:
+        answers: List of answer strings (may contain duplicates)
+        scores: List/array of scores for each answer
+        labels: List/array of labels for each answer
+        aggregation_method: How to aggregate scores for duplicate answers ("max", "mean")
+        
+    Returns:
+        K_q value in [0, 1], representing the fraction of correctly ranked unique answer pairs.
+        Returns np.nan if there are no correct-incorrect pairs after deduplication.
+    """
+    # Deduplicate answers and aggregate scores/labels
+    unique_answers, agg_scores, agg_labels = deduplicate_answers_with_scores(
+        answers, scores, labels, aggregation_method
+    )
+    
+    # Now calculate K_q on the unique answer sets
+    return calculate_k_q(agg_scores, agg_labels)
 
 
 def calculate_k_q(
@@ -183,7 +294,7 @@ def calculate_knowledge_for_entry(
     correct_label: Union[str, bool, None] = None
 ) -> Dict[str, float]:
     """
-    Calculate all knowledge metrics for a single data entry.
+    Calculate all knowledge metrics for a single data entry with proper answer deduplication.
     
     Args:
         entry: Dictionary containing question, answer_labels, and scores
@@ -197,10 +308,14 @@ def calculate_knowledge_for_entry(
         raise ValueError(f"Entry does not contain '{score_key}' field")
     
     scores = entry[score_key]
-    labels = _extract_labels_from_answer_labels(entry["answer_labels"])
+    answer_labels = entry["answer_labels"]
     
-    # Since we have one question per entry in the dataset
-    k_q = calculate_k_q(scores, labels, correct_label)
+    # Extract answers and labels from answer_labels pairs
+    answers = [pair[0] for pair in answer_labels]
+    labels = [pair[1] for pair in answer_labels]
+    
+    # Use the new K_q calculation with answer deduplication
+    k_q = calculate_k_q_with_answers(answers, scores, labels, aggregation_method="max")
     k = k_q  # In the dataset, |Q(s,r)| = 1
     k_star = 1 if (not np.isnan(k) and np.isclose(k, 1.0)) else 0
     
@@ -309,12 +424,50 @@ def test_label_detection():
     print("="*50)
 
 
+def test_answer_deduplication():
+    """Test the new answer deduplication functionality."""
+    print("\n" + "="*60)
+    print("Testing: Answer Deduplication Impact on K Calculation")
+    print("="*60)
+    
+    # Example: Same answers appearing multiple times with different scores
+    answers = ["Paris", "London", "Paris", "Berlin", "Paris", "London"]
+    scores = [0.9, 0.2, 0.7, 0.3, 0.8, 0.1]  # Paris: 0.9, 0.7, 0.8; London: 0.2, 0.1; Berlin: 0.3
+    labels = ["EXACT_MATCH", "False", "EXACT_MATCH", "False", "EXACT_MATCH", "False"]
+    
+    print("Original data (with duplicates):")
+    print("Answers:", answers)
+    print("Scores: ", scores)
+    print("Labels: ", labels)
+    
+    # Calculate K without deduplication (old way)
+    k_q_old = calculate_k_q(scores, labels)
+    print(f"\nK_q (without deduplication): {k_q_old:.4f}")
+    
+    # Calculate K with deduplication (new way)  
+    k_q_new = calculate_k_q_with_answers(answers, scores, labels, aggregation_method="max")
+    print(f"K_q (with deduplication):    {k_q_new:.4f}")
+    
+    # Show what deduplication did
+    unique_answers, agg_scores, agg_labels = deduplicate_answers_with_scores(answers, scores, labels)
+    print(f"\nAfter deduplication:")
+    print("Unique answers:", unique_answers)
+    print("Aggregated scores:", [f"{s:.1f}" for s in agg_scores])
+    print("Aggregated labels:", agg_labels)
+    
+    print(f"\nDifference: {abs(k_q_new - k_q_old):.4f}")
+    print("="*60)
+
+
 def main():
     """
     Example usage: Calculate knowledge metrics for the development set.
     """
     # Test the label detection first
     test_label_detection()
+    
+    # Test the new deduplication functionality
+    test_answer_deduplication()
     
     data_path = Path("./data/sampled_labeled_answers_1000_temp1/dev")
     

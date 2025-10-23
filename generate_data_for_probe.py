@@ -3,12 +3,16 @@ Generate training data for linear probes (internal knowledge scoring).
 
 This script implements KNOWLEDGE-AWARE PROBING as described in the paper's Appendix A.8.2:
 - Train ONLY on questions where the greedy answer is correct (model knows the answer)
-- For each such question, create MULTIPLE training pairs:
-  * Multiple positive examples: greedy correct + any other sampled correct answers
-  * Multiple negative examples: several sampled incorrect answers
-  
-This ensures the probe learns from questions where the model has knowledge,
-providing stronger discriminative signal for distinguishing correct from incorrect answers.
+- For each such question, create exactly 2 training examples:
+  * 1 positive example: the greedy correct answer
+  * 1 negative example: one randomly selected incorrect answer
+
+As per paper: "For the remaining questions, we randomly select one incorrect answer 
+along with the correct greedy answer for our final dataset."
+
+This balanced 1:1 approach ensures the probe learns from questions where the model 
+has knowledge, providing clear discriminative signal for distinguishing correct 
+from incorrect answers.
 """
 
 import json
@@ -69,55 +73,34 @@ def is_greedy_correct(
     return False
 
 
-def get_correct_answers(
-    greedy_answer: str,
+def get_random_incorrect_answer(
     answer_labels: List[List[str]]
-) -> List[str]:
+) -> Optional[str]:
     """
-    Get all correct answers (greedy + any correct sampled ones).
+    Get ONE randomly selected incorrect answer from the labeled answers.
     
-    Args:
-        greedy_answer: Answer from greedy decoding (already verified as correct)
-        answer_labels: List of [answer, label] pairs from sampling
-        
-    Returns:
-        List of unique correct answers
-    """
-    correct_answers = [greedy_answer]
-    
-    # Add other sampled correct answers (different from greedy)
-    for answer, label in answer_labels:
-        if label == "EXACT_MATCH":
-            # Normalize for comparison
-            if answer.strip().lower() != greedy_answer.strip().lower():
-                if answer not in correct_answers:
-                    correct_answers.append(answer)
-    
-    return correct_answers
-
-
-def get_incorrect_answers(
-    answer_labels: List[List[str]],
-    max_negatives: int = 5
-) -> List[str]:
-    """
-    Get multiple incorrect answers from the labeled answers.
+    As per paper: "we randomly select one incorrect answer along with 
+    the correct greedy answer for our final dataset."
     
     Args:
         answer_labels: List of [answer, label] pairs
-        max_negatives: Maximum number of negative examples to return
         
     Returns:
-        List of incorrect answers (up to max_negatives)
+        One randomly selected incorrect answer, or None if no incorrect answers found
     """
     incorrect_answers = []
     for answer, label in answer_labels:
         if label == "False":
-            if answer not in incorrect_answers:
-                incorrect_answers.append(answer)
-                if len(incorrect_answers) >= max_negatives:
-                    break
-    return incorrect_answers
+            incorrect_answers.append(answer)
+    
+    if not incorrect_answers:
+        return None
+    
+    # Randomly select one incorrect answer
+    import random
+    return random.choice(incorrect_answers)
+
+
 
 
 def extract_hidden_states(
@@ -198,17 +181,19 @@ def process_one_relation_train(
     model,
     tokenizer,
     device: str = "cuda",
-    max_negatives_per_question: int = 5,
     max_questions: int = None
 ) -> Tuple[List[Dict], Dict]:
     """
-    Process train split: KNOWLEDGE-AWARE PROBING.
+    Process train split: KNOWLEDGE-AWARE PROBING with 1:1 positive/negative sampling.
     
-    Strategy:
+    Paper strategy: "For the remaining questions, we randomly select one incorrect 
+    answer along with the correct greedy answer for our final dataset."
+    
+    Implementation:
     - ONLY use questions where greedy answer is correct (model knows the answer)
-    - For each such question, create multiple training pairs:
-      * Positive examples: greedy correct answer + any other sampled correct answers
-      * Negative examples: multiple sampled incorrect answers (up to max_negatives_per_question)
+    - For each such question, create exactly 2 training examples:
+      * 1 positive: the correct greedy answer
+      * 1 negative: one randomly selected incorrect answer
     
     Args:
         greedy_data: Data with greedy answers
@@ -216,7 +201,6 @@ def process_one_relation_train(
         model: The language model
         tokenizer: The tokenizer
         device: Device to run on
-        max_negatives_per_question: Max number of negative examples per question
         max_questions: Maximum number of questions to process (for limiting training set size)
         
     Returns:
@@ -226,7 +210,6 @@ def process_one_relation_train(
     stats = {
         "total_questions_examined": 0,
         "greedy_correct_questions": 0,
-        "questions_with_multiple_correct": 0,
         "questions_with_insufficient_incorrect": 0,
         "final_questions_used": 0,
         "total_positive_examples": 0,
@@ -260,59 +243,46 @@ def process_one_relation_train(
         
         stats["greedy_correct_questions"] += 1
         
-        # Get all correct answers (greedy + any other sampled correct ones)
-        correct_answers = get_correct_answers(greedy_answer, answer_labels)
+        # Get one randomly selected incorrect answer
+        incorrect_answer = get_random_incorrect_answer(answer_labels)
         
-        if len(correct_answers) > 1:
-            stats["questions_with_multiple_correct"] += 1
-        
-        # Get multiple incorrect answers
-        incorrect_answers = get_incorrect_answers(answer_labels, max_negatives_per_question)
-        
-        if len(incorrect_answers) == 0:
+        if incorrect_answer is None:
             stats["questions_with_insufficient_incorrect"] += 1
             continue
         
-        # Extract hidden states for all correct answers (positives)
-        correct_hidden_states_list = []
-        for correct_ans in correct_answers:
-            hidden_states = extract_hidden_states(
-                model, tokenizer, question, correct_ans, device
-            )
-            correct_hidden_states_list.append((correct_ans, hidden_states))
+        # Extract hidden states for the correct greedy answer (positive)
+        correct_hidden_states = extract_hidden_states(
+            model, tokenizer, question, greedy_answer, device
+        )
         
-        # Extract hidden states for all incorrect answers (negatives)
-        incorrect_hidden_states_list = []
-        for incorrect_ans in incorrect_answers:
-            hidden_states = extract_hidden_states(
-                model, tokenizer, question, incorrect_ans, device
-            )
-            incorrect_hidden_states_list.append((incorrect_ans, hidden_states))
+        # Extract hidden states for the randomly selected incorrect answer (negative)
+        incorrect_hidden_states = extract_hidden_states(
+            model, tokenizer, question, incorrect_answer, device
+        )
         
-        # Create training examples
-        # Positive examples
-        for correct_ans, hidden_states in correct_hidden_states_list:
-            training_examples.append({
-                "question": question,
-                "answer": correct_ans,
-                "label": 1,  # Correct
-                "hidden_states": {k: v.tolist() for k, v in hidden_states.items()},
-                "golden_answer": golden_answer,
-                "is_greedy": (correct_ans == greedy_answer)
-            })
-            stats["total_positive_examples"] += 1
+        # Create training examples: exactly 1 positive + 1 negative per question
         
-        # Negative examples
-        for incorrect_ans, hidden_states in incorrect_hidden_states_list:
-            training_examples.append({
-                "question": question,
-                "answer": incorrect_ans,
-                "label": 0,  # Incorrect
-                "hidden_states": {k: v.tolist() for k, v in hidden_states.items()},
-                "golden_answer": golden_answer,
-                "is_greedy": False
-            })
-            stats["total_negative_examples"] += 1
+        # Positive example: greedy correct answer
+        training_examples.append({
+            "question": question,
+            "answer": greedy_answer,
+            "label": 1,  # Correct
+            "hidden_states": {k: v.tolist() for k, v in correct_hidden_states.items()},
+            "golden_answer": golden_answer,
+            "is_greedy": True
+        })
+        stats["total_positive_examples"] += 1
+        
+        # Negative example: randomly selected incorrect answer
+        training_examples.append({
+            "question": question,
+            "answer": incorrect_answer,
+            "label": 0,  # Incorrect
+            "hidden_states": {k: v.tolist() for k, v in incorrect_hidden_states.items()},
+            "golden_answer": golden_answer,
+            "is_greedy": False
+        })
+        stats["total_negative_examples"] += 1
         
         stats["final_questions_used"] += 1
         questions_used += 1
@@ -457,12 +427,12 @@ def main(splits=["train", "dev"]):
     model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
     device = "cuda"
     from huggingface_hub import login
-    hf_token = # INSERT TOKEN
+    from key import KEY
+    hf_token = KEY
     login(hf_token)
     relations = ["P264"]
     
     # Train-specific settings
-    max_negatives_per_question = 5  # Multiple negatives per question for train
     max_questions_per_relation_train = 500  # Limit to 500 questions per relation for train
     
     # Dev/test-specific settings
@@ -476,11 +446,11 @@ def main(splits=["train", "dev"]):
     if len(sys.argv) > 1:
         splits = sys.argv[1:]
     else:
-        splits = ["train"]  # Default to train only
+        splits = ["test"]  # Default to train only
     
     print(f"Generating probe data for splits: {splits}")
     print(f"\nStrategies:")
-    print(f"  train: Knowledge-aware (greedy correct only, multiple pos/neg per question)")
+    print(f"  train: Knowledge-aware (greedy correct only, 1 positive + 1 random negative per question)")
     print(f"  dev/test: All questions (up to {max_answers_per_question_dev_test} answers, add golden if needed)")
     
     # Load model
@@ -521,7 +491,6 @@ def main(splits=["train", "dev"]):
                     model,
                     tokenizer,
                     device,
-                    max_negatives_per_question,
                     max_questions_per_relation_train
                 )
                 
@@ -529,12 +498,12 @@ def main(splits=["train", "dev"]):
                 print(f"\n  Statistics for {relation} ({split}):")
                 print(f"    Questions examined: {stats['total_questions_examined']}")
                 print(f"    Greedy correct: {stats['greedy_correct_questions']}")
-                print(f"    Questions with multiple correct answers: {stats['questions_with_multiple_correct']}")
                 print(f"    Questions with insufficient incorrect: {stats['questions_with_insufficient_incorrect']}")
                 print(f"    Final questions used: {stats['final_questions_used']}")
-                print(f"    Total positive examples: {stats['total_positive_examples']}")
-                print(f"    Total negative examples: {stats['total_negative_examples']}")
-                print(f"    Total examples: {len(training_examples)}")
+                print(f"    Total positive examples: {stats['total_positive_examples']} (1 per question)")
+                print(f"    Total negative examples: {stats['total_negative_examples']} (1 per question)")
+                print(f"    Total examples: {len(training_examples)} (2 per question)")
+                print(f"    Positive/Negative ratio: 1:1")
                 
             else:  # dev or test
                 # All questions with up to 100 answers

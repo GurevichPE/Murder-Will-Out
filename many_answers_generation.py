@@ -7,13 +7,15 @@ import transformers
 from huggingface_hub import login
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+from datasets import Dataset
+import numpy as np
 
 SYSTEM_PROMPT = """
 Your job is to answer an entity-centric question.
 You need to answer with the correct entity, without any additional information.
 """
 
-DATA_PATH = "./data/final_dataset"
+DATA_PATH = "./data/greedy_answers"
 SAVE_PATH = "./data/sampled_answers_1000_temp1"
 
 
@@ -67,11 +69,18 @@ def make_multiple_predictions(pipeline:transformers.Pipeline, question:str, num_
     return answers
 
 
-def load_pipeline() -> transformers.Pipeline:
+def load_pipeline(modes:List[str]) -> transformers.Pipeline:
     model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    hf_token = # INSERT TOKEN
+    from key import KEY
+    hf_token = KEY
     login(hf_token)
     
+    if modes == ["train"]:
+        t = 2.0
+    elif "train" not in modes:
+        t = 1.0
+    else:
+        raise ValueError("Modes should be or 'train' only or ('test' and/or 'dev') ")
     pipeline = transformers.pipeline(
         "text-generation",
         model=model_id,
@@ -79,7 +88,7 @@ def load_pipeline() -> transformers.Pipeline:
         device_map="auto",
         # Set sampling with temperature=1
         do_sample=True,
-        temperature=2.0,
+        temperature=t,
     )
 
     # Fix for batch processing: set pad_token and pad_token_id to enable batching
@@ -89,25 +98,33 @@ def load_pipeline() -> transformers.Pipeline:
     return pipeline
 
 
-def process_one_file(pipeline, data:List[Dict[str, str]]) -> List[Dict[str, str]]:
+def process_one_file(pipeline, data:List[Dict[str, str]], mode:str) -> List[Dict[str, str]]:
+    if mode == "train":
+        num_answers = 200
+    elif (mode == "test") or (mode == "dev"):
+        num_answers = 1000
+    else:
+        raise ValueError("Unsupported mode")
+
     for i in tqdm(range(len(data))):
         entry = data[i]
         question = entry["question"]
-        answers = make_multiple_predictions(pipeline, question, num_answers=500)
+        answers = make_multiple_predictions(pipeline, question, num_answers=num_answers)
         entry["sampled_answers"] = answers
         data[i] = entry
     return data
 
 
 def main():
-    pipeline = load_pipeline()
+    
     
     data_path = Path(DATA_PATH)
     save_path = Path(SAVE_PATH)
 
     # Only process test and dev datasets
     modes_to_process = ["train"]
-    codes_to_process = ["P176", "P264", "P40", "P50"]
+    pipeline = load_pipeline(modes_to_process)
+    codes_to_process = ["P50"]
 
     for mode in modes_to_process:
         if not (data_path / mode).exists():
@@ -122,7 +139,7 @@ def main():
         for file in os.listdir(mode_path):
             if any([(code in file) for code in codes_to_process]):
                 data = load_json(mode_path / file)
-                data_with_answers = process_one_file(pipeline, data)
+                data_with_answers = process_one_file(pipeline, data, mode)
 
                 savefile = save_path / mode / file
 

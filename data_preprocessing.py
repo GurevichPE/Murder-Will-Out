@@ -12,7 +12,7 @@ INITIAL_DATA_PATH = "./data/dataset"
 FINAL_PATH = "./data/final_dataset"
 
 MODES = ['train', 'test']
-TRAIN_SAMPLE = 500
+TRAIN_SAMPLE = 2000
 TEST_SAMPLE = 500
 DEV_SAMPLE = 50
 

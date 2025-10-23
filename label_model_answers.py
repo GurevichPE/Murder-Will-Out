@@ -57,7 +57,8 @@ def normalize_text(s: str) -> str:
 def load_pipeline() -> transformers.Pipeline:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    hf_token = # INSERT TOKEN
+    from key import KEY
+    hf_token = KEY
     login(hf_token)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, trust_remote_code=True, padding_side='left')
     model = AutoModelForCausalLM.from_pretrained(
@@ -179,9 +180,9 @@ def main(batch_size: int = 32):
     save_path = Path(SAVE_PATH)
 
     # Only process test and dev datasets
-    modes_to_process = ["dev"]
+    modes_to_process = ["train"]
 
-    codes_to_process = ["P176"]
+    codes_to_process = ["P40"]
 
     print(f"Using batch size: {batch_size}")
 

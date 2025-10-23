@@ -1,15 +1,23 @@
 """
-Train linear probes for internal knowledge scoring using pre-computed hidden states.
+Train logistic regression probes for internal knowledge scoring using pre-computed hidden states.
 
-This script:
-1. Loads pre-computed train hidden states from probe_training_data/
-2. Loads pre-computed dev hidden states from probe_training_data/
-3. For each layer, trains a logistic regression classifier
-4. Evaluates probe on dev set and calculates K, K* metrics
-5. Selects the best layer based on dev K
-6. Saves the trained probe and scaler for the best layer
+This script implements a comparative experiment evaluating probes on:
+1. Full dev dataset (all questions)
+2. Greedy-correct dev subset (only questions where greedy decoding is correct)
 
-All hidden states are pre-computed - no model loading needed!
+The script:
+1. Loads pre-computed train/dev hidden states from probe_training_data/
+2. For each layer, trains a logistic regression classifier
+3. Evaluates on both full dev set and greedy-correct subset
+4. Compares performance to understand how probe quality varies with model "knowledge"
+5. Selects the best layer and saves the trained probe
+
+Features:
+- All hidden states are pre-computed - no model loading needed!
+- Dual evaluation strategy: full vs greedy-correct dev sets
+- Answer deduplication for accurate K/K* calculations
+- Comprehensive comparison analysis showing performance differences
+- Visualizations comparing full vs greedy-correct evaluation results
 """
 
 import json
@@ -24,7 +32,7 @@ from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from knowledge_calculation import calculate_k_q
+from knowledge_calculation import calculate_k_q, calculate_k_q_with_answers
 
 
 def load_json(path: Path) -> List[Dict]:
@@ -43,6 +51,69 @@ def save_json(data: dict, path: Path) -> None:
     """Save data to JSON file."""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def save_plotting_data(all_metrics: List[Dict], output_path: Path) -> None:
+    """
+    Save all plotting data to enable plot generation without retraining.
+    
+    Args:
+        all_metrics: List of metrics dicts for each layer
+        output_path: Path to save the plotting data
+    """
+    plotting_data = {
+        "layers": [m["layer"] for m in all_metrics],
+        "train_auc": [m["train_auc"] for m in all_metrics],
+        "train_accuracy": [m["train_accuracy"] for m in all_metrics],
+        "dev_auc_full": [m["dev_auc_full"] for m in all_metrics],
+        "dev_accuracy_full": [m["dev_accuracy_full"] for m in all_metrics],
+        "dev_k_full": [m["dev_k_full"] for m in all_metrics],
+        "dev_k_star_full": [m["dev_k_star_full"] for m in all_metrics],
+        "dev_auc_greedy": [m["dev_auc_greedy"] for m in all_metrics],
+        "dev_accuracy_greedy": [m["dev_accuracy_greedy"] for m in all_metrics],
+        "dev_k_greedy": [m["dev_k_greedy"] for m in all_metrics],
+        "dev_k_star_greedy": [m["dev_k_star_greedy"] for m in all_metrics]
+    }
+    
+    save_json(plotting_data, output_path)
+    print(f"Plotting data saved to: {output_path}")
+
+
+def generate_plots_from_saved_data(plotting_data_path: Path, output_dir: Path) -> None:
+    """
+    Generate all plots using previously saved plotting data.
+    
+    This function allows you to regenerate plots without retraining probes.
+    
+    Args:
+        plotting_data_path: Path to the saved plotting data JSON file
+        output_dir: Directory to save the generated plots
+        
+    Example:
+        plotting_data_path = Path("./models/probes/plotting_data.json")
+        output_dir = Path("./models/probes/plots")
+        generate_plots_from_saved_data(plotting_data_path, output_dir)
+    """
+    if not plotting_data_path.exists():
+        raise FileNotFoundError(f"Plotting data file not found: {plotting_data_path}")
+    
+    # Load plotting data
+    plotting_data = load_json(plotting_data_path)
+    print(f"Loaded plotting data from: {plotting_data_path}")
+    
+    # Create output directory
+    output_dir.mkdir(exist_ok=True, parents=True)
+    
+    print(f"Generating plots in: {output_dir}")
+    
+    # Generate all plots
+    print("Generating full dev set plots...")
+    plot_full_dev_metrics(plotting_data, output_dir)
+    
+    print("Generating comparison plots...")
+    plot_full_vs_greedy_comparison(plotting_data, output_dir)
+    
+    print("All plots generated successfully!")
 
 
 def load_probe_training_data(
@@ -133,26 +204,113 @@ def load_probe_training_data(
     return hidden_states_by_layer, labels, metadata
 
 
+def load_and_filter_greedy_correct_dev(
+    dev_hidden_states: Dict[int, np.ndarray],
+    dev_labels: np.ndarray,
+    dev_metadata: List[Dict],
+    relations: List[str]
+) -> Tuple[Dict[int, np.ndarray], np.ndarray, List[Dict]]:
+    """
+    Load greedy answers and filter dev set to only include examples where 
+    greedy answer exactly matches the golden answer.
+    
+    Args:
+        dev_hidden_states: Dict mapping layer_idx -> dev hidden states
+        dev_labels: Dev labels
+        dev_metadata: Dev metadata
+        relations: List of relation codes
+        
+    Returns:
+        Tuple of (filtered_hidden_states_dict, filtered_labels, filtered_metadata)
+    """
+    # Load all greedy answer data
+    greedy_data_by_question = {}
+    
+    for relation in relations:
+        greedy_file = Path(f"./data/greedy_answers/dev/{relation}.dev.json")
+        if not greedy_file.exists():
+            print(f"Warning: Greedy answers file not found: {greedy_file}")
+            continue
+            
+        print(f"Loading greedy answers from {greedy_file}")
+        with open(greedy_file, 'r', encoding='utf-8') as f:
+            greedy_data = json.load(f)
+        
+        for entry in greedy_data:
+            question = entry["question"]
+            greedy_answer = entry["greedy_answer"]
+            golden_answers = entry["answers"]  # These are the golden/correct answers
+            
+            # Store the greedy data for this question
+            greedy_data_by_question[question] = {
+                "greedy_answer": greedy_answer,
+                "golden_answers": golden_answers
+            }
+    
+    print(f"Loaded greedy data for {len(greedy_data_by_question)} questions")
+    
+    # Filter dev examples to only keep those where greedy answer exactly matches golden answer
+    filtered_indices = []
+    greedy_correct_count = 0
+    
+    for idx, meta in enumerate(dev_metadata):
+        question = meta["question"]
+        
+        if question in greedy_data_by_question:
+            greedy_info = greedy_data_by_question[question]
+            greedy_answer = greedy_info["greedy_answer"]
+            golden_answers = greedy_info["golden_answers"]
+            
+            # Check if greedy answer exactly matches any golden answer
+            is_exact_match = any(
+                greedy_answer.strip() == golden.strip()
+                for golden in golden_answers
+            )
+            
+            if is_exact_match:
+                filtered_indices.append(idx)
+                if idx == len([i for i in range(idx) if dev_metadata[i]["question"] == question]):
+                    # Only count once per question (first occurrence)
+                    greedy_correct_count += 1
+    
+    print(f"Found {greedy_correct_count} questions with exact greedy matches")
+    print(f"Filtering {len(filtered_indices)}/{len(dev_metadata)} examples ({len(filtered_indices)/len(dev_metadata):.1%})")
+    
+    if len(filtered_indices) == 0:
+        print("Warning: No examples found where greedy answer exactly matches golden answer!")
+        return {}, np.array([]), []
+    
+    # Filter all data
+    filtered_indices = np.array(filtered_indices)
+    filtered_labels = dev_labels[filtered_indices]
+    filtered_metadata = [dev_metadata[i] for i in filtered_indices]
+    
+    # Filter hidden states for all layers
+    filtered_hidden_states = {}
+    for layer_idx, layer_states in dev_hidden_states.items():
+        filtered_hidden_states[layer_idx] = layer_states[filtered_indices]
+    
+    return filtered_hidden_states, filtered_labels, filtered_metadata
+
+
 def calculate_k_metrics_for_dev(
     dev_hidden_states: np.ndarray,
     dev_labels: np.ndarray,
     dev_metadata: List[Dict],
     probe,
-    scaler,
-    balanced_evaluation: bool = True
+    scaler
 ) -> Tuple[float, float]:
     """
     Calculate K and K* metrics on dev set using pre-computed hidden states.
     
-    Groups examples by question and calculates knowledge metrics.
+    Groups examples by question and calculates knowledge metrics using answer deduplication.
     
     Args:
         dev_hidden_states: Hidden states for all dev examples (n_examples, hidden_dim)
         dev_labels: Labels (0 or 1) for all dev examples
         dev_metadata: Metadata with question, answer, golden_answer for each example
-        probe: Trained probe
-        scaler: Fitted scaler
-        balanced_evaluation: If True, balance labels per question (like in appendix)
+        probe: Trained MLP classifier
+        scaler: Fitted StandardScaler
         
     Returns:
         Tuple of (mean_k, mean_k_star)
@@ -171,7 +329,8 @@ def calculate_k_metrics_for_dev(
             question_groups[question] = {
                 "indices": [],
                 "scores": [],
-                "is_correct": []
+                "is_correct": [],
+                "answers": []
             }
         
         # Use the actual label from the data (not golden answer comparison)
@@ -180,6 +339,7 @@ def calculate_k_metrics_for_dev(
         question_groups[question]["indices"].append(idx)
         question_groups[question]["scores"].append(probe_scores[idx])
         question_groups[question]["is_correct"].append(is_correct)
+        question_groups[question]["answers"].append(meta["answer"])
     
     # Calculate K_q for each question
     k_values = []
@@ -190,6 +350,7 @@ def calculate_k_metrics_for_dev(
         indices = np.array(data["indices"])
         scores = np.array(data["scores"])
         is_correct = np.array(data["is_correct"])
+        answers = data["answers"]
         
         # Check if we have both correct and incorrect answers
         correct_indices = np.where(is_correct)[0]
@@ -204,31 +365,9 @@ def calculate_k_metrics_for_dev(
             print(f"Warning: Question '{question[:50]}...' has {reason} - skipping per paper Section 4.2")
             continue
         
-        if balanced_evaluation:
-            # BALANCED EVALUATION: Sample equal numbers of correct/incorrect 
-            # Per appendix: "balance test labels by sampling one correct and one incorrect answer per question"
-            
-            # Sample equal numbers (minimum of the two)
-            n_samples = min(len(correct_indices), len(incorrect_indices), 10)  # Max 10 each for efficiency
-            
-            if n_samples > 0:
-                # Randomly sample n_samples from each group
-                np.random.seed(42)  # For reproducibility
-                sampled_correct = np.random.choice(correct_indices, size=n_samples, replace=False)
-                sampled_incorrect = np.random.choice(incorrect_indices, size=n_samples, replace=False)
-                
-                # Combine samples
-                sampled_indices = np.concatenate([sampled_correct, sampled_incorrect])
-                balanced_scores = scores[sampled_indices]
-                balanced_labels = is_correct[sampled_indices]
-                
-                # Calculate K_q on balanced data
-                k_q = calculate_k_q(balanced_scores, balanced_labels)
-            else:
-                k_q = np.nan
-        else:
-            # UNBALANCED EVALUATION: Use all data (original approach)
-            k_q = calculate_k_q(scores, is_correct)
+        # Calculate K_q with answer deduplication
+        # This properly handles cases where the same answer appears multiple times
+        k_q = calculate_k_q_with_answers(answers, scores, is_correct, aggregation_method="max")
         
         # Only include valid K_q values (not NaN)
         if not np.isnan(k_q):
@@ -238,8 +377,6 @@ def calculate_k_metrics_for_dev(
             k_star = 1.0 if k_q == 1.0 else 0.0
             k_star_values.append(k_star)
     
-    balance_mode = "BALANCED" if balanced_evaluation else "UNBALANCED"
-    print(f"Evaluation mode: {balance_mode}")
     print(f"Processed {len(question_groups)} questions, skipped {skipped_questions} questions")
     print(f"Valid K_q calculations: {len(k_values)}")
     
@@ -253,31 +390,41 @@ def calculate_k_metrics_for_dev(
 def train_probe_for_layer(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    X_dev: np.ndarray,
-    y_dev: np.ndarray,
-    dev_metadata: List[Dict],
+    X_dev_full: np.ndarray,
+    y_dev_full: np.ndarray,
+    dev_metadata_full: List[Dict],
+    X_dev_greedy: np.ndarray,
+    y_dev_greedy: np.ndarray,
+    dev_metadata_greedy: List[Dict],
     layer_idx: int,
     random_state: int = 42
 ) -> Tuple[LogisticRegression, StandardScaler, Dict[str, float]]:
     """
     Train a logistic regression probe for a specific layer using pre-computed hidden states.
+    Evaluates on both full dev set and greedy-correct dev subset.
     
     Args:
         X_train: Training hidden states
         y_train: Training labels
-        X_dev: Dev hidden states
-        y_dev: Dev labels
-        dev_metadata: Dev metadata for calculating K metrics
+        X_dev_full: Full dev hidden states
+        y_dev_full: Full dev labels
+        dev_metadata_full: Full dev metadata
+        X_dev_greedy: Greedy-correct dev hidden states
+        y_dev_greedy: Greedy-correct dev labels
+        dev_metadata_greedy: Greedy-correct dev metadata
         layer_idx: Layer index (for logging)
         random_state: Random seed
         
     Returns:
         Tuple of (trained_probe, scaler, metrics_dict)
     """
+
     # Standardize features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
-    X_dev_scaled = scaler.transform(X_dev)
+    X_dev_full_scaled = scaler.transform(X_dev_full)
+    
+    print(f"  Layer {layer_idx}: Training logistic regression on {X_train_scaled.shape[1]} features")
     
     # Train logistic regression
     probe = LogisticRegression(
@@ -291,36 +438,53 @@ def train_probe_for_layer(
     
     # Evaluate on train set (binary classification metrics)
     y_train_pred_proba = probe.predict_proba(X_train_scaled)[:, 1]
+    y_train_pred = probe.predict(X_train_scaled)
     train_auc = roc_auc_score(y_train, y_train_pred_proba)
+    train_accuracy = accuracy_score(y_train, y_train_pred)
     
-    # Evaluate on dev set (K metrics) - use balanced evaluation to match paper
-    print(f"  Layer {layer_idx}: Evaluating K metrics...")
-    dev_k_balanced, dev_k_star_balanced = calculate_k_metrics_for_dev(
-        X_dev, y_dev, dev_metadata, probe, scaler, balanced_evaluation=True
+    # Evaluate on full dev set
+    print(f"  Layer {layer_idx}: Evaluating on full dev set...")
+    y_dev_full_pred_proba = probe.predict_proba(X_dev_full_scaled)[:, 1]
+    y_dev_full_pred = probe.predict(X_dev_full_scaled)
+    dev_auc_full = roc_auc_score(y_dev_full, y_dev_full_pred_proba)
+    dev_accuracy_full = accuracy_score(y_dev_full, y_dev_full_pred)
+    
+    dev_k_full, dev_k_star_full = calculate_k_metrics_for_dev(
+        X_dev_full, y_dev_full, dev_metadata_full, probe, scaler
     )
     
-    # Also run unbalanced for comparison
-    print(f"  Layer {layer_idx}: Running unbalanced evaluation for comparison...")
-    dev_k_unbalanced, dev_k_star_unbalanced = calculate_k_metrics_for_dev(
-        X_dev, y_dev, dev_metadata, probe, scaler, balanced_evaluation=False
-    )
+    # Evaluate on greedy-correct subset of dev set
+    print(f"  Layer {layer_idx}: Evaluating on greedy-correct dev subset...")
+    if len(y_dev_greedy) > 0:
+        X_dev_greedy_scaled = scaler.transform(X_dev_greedy)
+        y_dev_greedy_pred_proba = probe.predict_proba(X_dev_greedy_scaled)[:, 1]
+        y_dev_greedy_pred = probe.predict(X_dev_greedy_scaled)
+        dev_auc_greedy = roc_auc_score(y_dev_greedy, y_dev_greedy_pred_proba)
+        dev_accuracy_greedy = accuracy_score(y_dev_greedy, y_dev_greedy_pred)
+        
+        dev_k_greedy, dev_k_star_greedy = calculate_k_metrics_for_dev(
+            X_dev_greedy, y_dev_greedy, dev_metadata_greedy, probe, scaler
+        )
+    else:
+        dev_auc_greedy = dev_accuracy_greedy = dev_k_greedy = dev_k_star_greedy = 0.0
     
     print(f"  Layer {layer_idx} Results:")
-    print(f"    Balanced:   K = {dev_k_balanced:.3f}, K* = {dev_k_star_balanced:.3f}")  
-    print(f"    Unbalanced: K = {dev_k_unbalanced:.3f}, K* = {dev_k_star_unbalanced:.3f}")
-    
-    # Use balanced for layer selection (following paper)
-    dev_k, dev_k_star = dev_k_balanced, dev_k_star_balanced
+    print(f"    Train AUC: {train_auc:.3f}, Train Acc: {train_accuracy:.3f}")
+    print(f"    Dev (Full) AUC: {dev_auc_full:.3f}, Acc: {dev_accuracy_full:.3f}, K: {dev_k_full:.3f}, K*: {dev_k_star_full:.3f}")
+    print(f"    Dev (Greedy) AUC: {dev_auc_greedy:.3f}, Acc: {dev_accuracy_greedy:.3f}, K: {dev_k_greedy:.3f}, K*: {dev_k_star_greedy:.3f}")
     
     metrics = {
         "layer": layer_idx,
         "train_auc": float(train_auc),
-        "dev_k": float(dev_k),
-        "dev_k_star": float(dev_k_star),
-        "dev_k_balanced": float(dev_k_balanced),
-        "dev_k_star_balanced": float(dev_k_star_balanced), 
-        "dev_k_unbalanced": float(dev_k_unbalanced),
-        "dev_k_star_unbalanced": float(dev_k_star_unbalanced)
+        "train_accuracy": float(train_accuracy),
+        "dev_auc_full": float(dev_auc_full),
+        "dev_accuracy_full": float(dev_accuracy_full),
+        "dev_k_full": float(dev_k_full),
+        "dev_k_star_full": float(dev_k_star_full),
+        "dev_auc_greedy": float(dev_auc_greedy),
+        "dev_accuracy_greedy": float(dev_accuracy_greedy),
+        "dev_k_greedy": float(dev_k_greedy),
+        "dev_k_star_greedy": float(dev_k_star_greedy)
     }
     
     return probe, scaler, metrics
@@ -329,19 +493,26 @@ def train_probe_for_layer(
 def train_all_layers(
     train_hidden_states: Dict[int, np.ndarray],
     train_labels: np.ndarray,
-    dev_hidden_states: Dict[int, np.ndarray],
-    dev_labels: np.ndarray,
-    dev_metadata: List[Dict]
+    dev_hidden_states_full: Dict[int, np.ndarray],
+    dev_labels_full: np.ndarray,
+    dev_metadata_full: List[Dict],
+    dev_hidden_states_greedy: Dict[int, np.ndarray],
+    dev_labels_greedy: np.ndarray,
+    dev_metadata_greedy: List[Dict]
 ) -> Tuple[Dict[int, Tuple], List[Dict]]:
     """
     Train probes for all layers using pre-computed hidden states.
+    Evaluates on both full dev set and greedy-correct dev subset.
     
     Args:
         train_hidden_states: Dict mapping layer_idx -> train hidden states
         train_labels: Train labels
-        dev_hidden_states: Dict mapping layer_idx -> dev hidden states
-        dev_labels: Dev labels
-        dev_metadata: Dev metadata for K calculations
+        dev_hidden_states_full: Dict mapping layer_idx -> full dev hidden states
+        dev_labels_full: Full dev labels
+        dev_metadata_full: Full dev metadata
+        dev_hidden_states_greedy: Dict mapping layer_idx -> greedy-correct dev hidden states
+        dev_labels_greedy: Greedy-correct dev labels
+        dev_metadata_greedy: Greedy-correct dev metadata
         
     Returns:
         Tuple of (probes_dict, all_metrics)
@@ -358,9 +529,12 @@ def train_all_layers(
         probe, scaler, metrics = train_probe_for_layer(
             train_hidden_states[layer_idx],
             train_labels,
-            dev_hidden_states[layer_idx],
-            dev_labels,
-            dev_metadata,
+            dev_hidden_states_full[layer_idx],
+            dev_labels_full,
+            dev_metadata_full,
+            dev_hidden_states_greedy[layer_idx],
+            dev_labels_greedy,
+            dev_metadata_greedy,
             layer_idx
         )
         
@@ -372,7 +546,7 @@ def train_all_layers(
 
 def select_best_layer(
     all_metrics: List[Dict],
-    criterion: str = "dev_k"
+    criterion: str = "dev_k_full"
 ) -> int:
     """
     Select the best layer based on dev set performance.
@@ -393,7 +567,7 @@ def plot_layer_performance(
     output_path: Path
 ):
     """
-    Plot K performance metrics across all layers.
+    Plot performance metrics comparing full dev vs greedy-correct dev evaluation.
     
     Args:
         all_metrics: List of metrics dicts for each layer
@@ -401,43 +575,263 @@ def plot_layer_performance(
     """
     layers = [m["layer"] for m in all_metrics]
     train_auc = [m["train_auc"] for m in all_metrics]
-    dev_k = [m["dev_k"] for m in all_metrics]
-    dev_k_star = [m["dev_k_star"] for m in all_metrics]
+    train_accuracy = [m["train_accuracy"] for m in all_metrics]
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    dev_auc_full = [m["dev_auc_full"] for m in all_metrics]
+    dev_accuracy_full = [m["dev_accuracy_full"] for m in all_metrics]
+    dev_k_full = [m["dev_k_full"] for m in all_metrics]
+    dev_k_star_full = [m["dev_k_star_full"] for m in all_metrics]
     
-    # Plot Train AUC vs Dev K
+    dev_auc_greedy = [m["dev_auc_greedy"] for m in all_metrics]
+    dev_accuracy_greedy = [m["dev_accuracy_greedy"] for m in all_metrics]
+    dev_k_greedy = [m["dev_k_greedy"] for m in all_metrics]
+    dev_k_star_greedy = [m["dev_k_star_greedy"] for m in all_metrics]
+    
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # Plot AUC comparison: Full vs Greedy-Correct
     ax1.plot(layers, train_auc, 'o-', label='Train AUC', linewidth=2, markersize=4, color='blue')
-    ax1_twin = ax1.twinx()
-    ax1_twin.plot(layers, dev_k, 's-', label='Dev K', linewidth=2, markersize=4, color='green')
-    
+    ax1.plot(layers, dev_auc_full, 's-', label='Dev AUC (Full)', linewidth=2, markersize=4, color='orange')
+    ax1.plot(layers, dev_auc_greedy, '^-', label='Dev AUC (Greedy)', linewidth=2, markersize=4, color='red')
     ax1.set_xlabel('Layer', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('Train AUC', fontsize=12, fontweight='bold', color='blue')
-    ax1_twin.set_ylabel('Dev K', fontsize=12, fontweight='bold', color='green')
-    ax1.tick_params(axis='y', labelcolor='blue')
-    ax1_twin.tick_params(axis='y', labelcolor='green')
-    ax1.set_title('Train AUC vs Dev K by Layer', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('AUC Score', fontsize=12, fontweight='bold')
+    ax1.set_title('AUC: Full vs Greedy-Correct Dev', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=10)
     ax1.grid(alpha=0.3)
+    ax1.set_ylim(0, 1)
     
-    # Highlight best layer
-    best_idx = np.argmax(dev_k)
-    ax1.axvline(x=layers[best_idx], color='red', linestyle='--', alpha=0.5, linewidth=2)
-    
-    # Plot K and K*
-    ax2.plot(layers, dev_k, 'o-', label='Dev K', linewidth=2, markersize=4)
-    ax2.plot(layers, dev_k_star, 's-', label='Dev K*', linewidth=2, markersize=4)
+    # Plot K metrics comparison: Full vs Greedy-Correct
+    ax2.plot(layers, dev_k_full, 'o-', label='Dev K (Full)', linewidth=2, markersize=4, color='green')
+    ax2.plot(layers, dev_k_greedy, 's-', label='Dev K (Greedy)', linewidth=2, markersize=4, color='darkgreen')
+    ax2.plot(layers, dev_k_star_full, '^-', label='Dev K* (Full)', linewidth=2, markersize=4, color='red')
+    ax2.plot(layers, dev_k_star_greedy, 'v-', label='Dev K* (Greedy)', linewidth=2, markersize=4, color='darkred')
     ax2.set_xlabel('Layer', fontsize=12, fontweight='bold')
     ax2.set_ylabel('Knowledge Metric', fontsize=12, fontweight='bold')
-    ax2.set_title('Dev Knowledge by Layer', fontsize=14, fontweight='bold')
-    ax2.legend(fontsize=10)
+    ax2.set_title('K Metrics: Full vs Greedy-Correct Dev', fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=9)
     ax2.grid(alpha=0.3)
+    ax2.set_ylim(0, 1)
     
-    # Highlight best layer
-    ax2.axvline(x=layers[best_idx], color='red', linestyle='--', alpha=0.5, linewidth=2, label=f'Best: Layer {layers[best_idx]}')
+    # Plot Accuracy comparison: Full vs Greedy-Correct  
+    ax3.plot(layers, train_accuracy, 'o-', label='Train Accuracy', linewidth=2, markersize=4, color='blue')
+    ax3.plot(layers, dev_accuracy_full, 's-', label='Dev Acc (Full)', linewidth=2, markersize=4, color='orange')
+    ax3.plot(layers, dev_accuracy_greedy, '^-', label='Dev Acc (Greedy)', linewidth=2, markersize=4, color='red')
+    ax3.set_xlabel('Layer', fontsize=12, fontweight='bold')
+    ax3.set_ylabel('Accuracy', fontsize=12, fontweight='bold')
+    ax3.set_title('Accuracy: Full vs Greedy-Correct Dev', fontsize=14, fontweight='bold')
+    ax3.legend(fontsize=10)
+    ax3.grid(alpha=0.3)
+    ax3.set_ylim(0, 1)
+    
+    # Plot Performance improvement on Greedy subset
+    k_improvement = [g - f for f, g in zip(dev_k_full, dev_k_greedy)]
+    auc_improvement = [g - f for f, g in zip(dev_auc_full, dev_auc_greedy)]
+    acc_improvement = [g - f for f, g in zip(dev_accuracy_full, dev_accuracy_greedy)]
+    
+    ax4.plot(layers, k_improvement, 'o-', label='K Improvement', linewidth=2, markersize=4, color='green')
+    ax4.plot(layers, auc_improvement, 's-', label='AUC Improvement', linewidth=2, markersize=4, color='blue')
+    ax4.plot(layers, acc_improvement, '^-', label='Acc Improvement', linewidth=2, markersize=4, color='orange')
+    ax4.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+    ax4.set_xlabel('Layer', fontsize=12, fontweight='bold')
+    ax4.set_ylabel('Performance Improvement', fontsize=12, fontweight='bold')
+    ax4.set_title('Greedy-Correct vs Full Dev Improvement', fontsize=14, fontweight='bold')
+    ax4.legend(fontsize=10)
+    ax4.grid(alpha=0.3)
+    
+    # Highlight best layer based on full dev K
+    best_idx = np.argmax(dev_k_full)
+    for ax in [ax1, ax2, ax3, ax4]:
+        ax.axvline(x=layers[best_idx], color='red', linestyle='--', alpha=0.5, linewidth=2)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"Plot saved to: {output_path}")
+    plt.close()
+
+
+def plot_full_dev_metrics(plotting_data: Dict, output_dir: Path) -> None:
+    """
+    Create separate plots for accuracy, AUC, and K/K* metrics using only full dev set evaluation.
+    
+    Args:
+        plotting_data: Dictionary containing all plotting data
+        output_dir: Directory to save the plots
+    """
+    layers = plotting_data["layers"]
+    train_auc = plotting_data["train_auc"]
+    train_accuracy = plotting_data["train_accuracy"]
+    dev_auc_full = plotting_data["dev_auc_full"]
+    dev_accuracy_full = plotting_data["dev_accuracy_full"]
+    dev_k_full = plotting_data["dev_k_full"]
+    dev_k_star_full = plotting_data["dev_k_star_full"]
+    
+    # Find best layer for highlighting
+    best_idx = np.argmax(dev_k_full)
+    
+    # Plot 1: Accuracy (Full Dev Only)
+    plt.figure(figsize=(10, 6))
+    plt.plot(layers, train_accuracy, 'o-', label='Train Accuracy', linewidth=2, markersize=6, color='blue')
+    plt.plot(layers, dev_accuracy_full, 's-', label='Dev Accuracy', linewidth=2, markersize=6, color='orange')
+    plt.axvline(x=layers[best_idx], color='red', linestyle='--', alpha=0.5, linewidth=2, label=f'Best Layer ({layers[best_idx]})')
+    plt.xlabel('Layer', fontsize=12, fontweight='bold')
+    plt.ylabel('Accuracy', fontsize=12, fontweight='bold')
+    plt.title('Accuracy by Layer (Full Dev Set)', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    
+    accuracy_path = output_dir / "accuracy_full_dev.png"
+    plt.savefig(accuracy_path, dpi=300, bbox_inches='tight')
+    print(f"Accuracy plot (full dev) saved to: {accuracy_path}")
+    plt.close()
+    
+    # Plot 2: AUC (Full Dev Only)
+    plt.figure(figsize=(10, 6))
+    plt.plot(layers, train_auc, 'o-', label='Train AUC', linewidth=2, markersize=6, color='blue')
+    plt.plot(layers, dev_auc_full, 's-', label='Dev AUC', linewidth=2, markersize=6, color='orange')
+    plt.axvline(x=layers[best_idx], color='red', linestyle='--', alpha=0.5, linewidth=2, label=f'Best Layer ({layers[best_idx]})')
+    plt.xlabel('Layer', fontsize=12, fontweight='bold')
+    plt.ylabel('AUC Score', fontsize=12, fontweight='bold')
+    plt.title('AUC by Layer (Full Dev Set)', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    
+    auc_path = output_dir / "auc_full_dev.png"
+    plt.savefig(auc_path, dpi=300, bbox_inches='tight')
+    print(f"AUC plot (full dev) saved to: {auc_path}")
+    plt.close()
+    
+    # Plot 3: K and K* Metrics (Full Dev Only)
+    plt.figure(figsize=(10, 6))
+    plt.plot(layers, dev_k_full, 'o-', label='K (Knowledge)', linewidth=2, markersize=6, color='green')
+    plt.plot(layers, dev_k_star_full, 's-', label='K* (Perfect Knowledge)', linewidth=2, markersize=6, color='darkgreen')
+    plt.axvline(x=layers[best_idx], color='red', linestyle='--', alpha=0.5, linewidth=2, label=f'Best Layer ({layers[best_idx]})')
+    plt.xlabel('Layer', fontsize=12, fontweight='bold')
+    plt.ylabel('Knowledge Metric', fontsize=12, fontweight='bold')
+    plt.title('Knowledge Metrics by Layer (Full Dev Set)', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    
+    k_metrics_path = output_dir / "k_metrics_full_dev.png"
+    plt.savefig(k_metrics_path, dpi=300, bbox_inches='tight')
+    print(f"K metrics plot (full dev) saved to: {k_metrics_path}")
+    plt.close()
+
+
+def plot_full_vs_greedy_comparison(plotting_data: Dict, output_dir: Path) -> None:
+    """
+    Create separate plots comparing full dev vs greedy-correct dev evaluation for accuracy, AUC, and K/K*.
+    
+    Args:
+        plotting_data: Dictionary containing all plotting data
+        output_dir: Directory to save the plots
+    """
+    layers = plotting_data["layers"]
+    dev_auc_full = plotting_data["dev_auc_full"]
+    dev_accuracy_full = plotting_data["dev_accuracy_full"]
+    dev_k_full = plotting_data["dev_k_full"]
+    dev_k_star_full = plotting_data["dev_k_star_full"]
+    dev_auc_greedy = plotting_data["dev_auc_greedy"]
+    dev_accuracy_greedy = plotting_data["dev_accuracy_greedy"]
+    dev_k_greedy = plotting_data["dev_k_greedy"]
+    dev_k_star_greedy = plotting_data["dev_k_star_greedy"]
+    
+    # Find best layer for highlighting
+    best_idx = np.argmax(dev_k_full)
+    
+    # Plot 1: Accuracy Comparison
+    plt.figure(figsize=(12, 6))
+    plt.plot(layers, dev_accuracy_full, 'o-', label='Full Dev Set', linewidth=2, markersize=6, color='blue')
+    plt.plot(layers, dev_accuracy_greedy, 's-', label='Greedy-Correct Subset', linewidth=2, markersize=6, color='red')
+    plt.axvline(x=layers[best_idx], color='gray', linestyle='--', alpha=0.5, linewidth=2, label=f'Best Layer ({layers[best_idx]})')
+    plt.xlabel('Layer', fontsize=12, fontweight='bold')
+    plt.ylabel('Accuracy', fontsize=12, fontweight='bold')
+    plt.title('Accuracy Comparison: Full Dev vs Greedy-Correct Subset', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    
+    accuracy_comp_path = output_dir / "accuracy_comparison.png"
+    plt.savefig(accuracy_comp_path, dpi=300, bbox_inches='tight')
+    print(f"Accuracy comparison plot saved to: {accuracy_comp_path}")
+    plt.close()
+    
+    # Plot 2: AUC Comparison
+    plt.figure(figsize=(12, 6))
+    plt.plot(layers, dev_auc_full, 'o-', label='Full Dev Set', linewidth=2, markersize=6, color='blue')
+    plt.plot(layers, dev_auc_greedy, 's-', label='Greedy-Correct Subset', linewidth=2, markersize=6, color='red')
+    plt.axvline(x=layers[best_idx], color='gray', linestyle='--', alpha=0.5, linewidth=2, label=f'Best Layer ({layers[best_idx]})')
+    plt.xlabel('Layer', fontsize=12, fontweight='bold')
+    plt.ylabel('AUC Score', fontsize=12, fontweight='bold')
+    plt.title('AUC Comparison: Full Dev vs Greedy-Correct Subset', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    
+    auc_comp_path = output_dir / "auc_comparison.png"
+    plt.savefig(auc_comp_path, dpi=300, bbox_inches='tight')
+    print(f"AUC comparison plot saved to: {auc_comp_path}")
+    plt.close()
+    
+    # Plot 3: K Metrics Comparison
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # K metric comparison
+    ax1.plot(layers, dev_k_full, 'o-', label='Full Dev Set', linewidth=2, markersize=6, color='green')
+    ax1.plot(layers, dev_k_greedy, 's-', label='Greedy-Correct Subset', linewidth=2, markersize=6, color='darkgreen')
+    ax1.axvline(x=layers[best_idx], color='gray', linestyle='--', alpha=0.5, linewidth=2)
+    ax1.set_xlabel('Layer', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('K (Knowledge Metric)', fontsize=12, fontweight='bold')
+    ax1.set_title('K Metric Comparison', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=11)
+    ax1.grid(alpha=0.3)
+    ax1.set_ylim(0, 1)
+    
+    # K* metric comparison
+    ax2.plot(layers, dev_k_star_full, 'o-', label='Full Dev Set', linewidth=2, markersize=6, color='red')
+    ax2.plot(layers, dev_k_star_greedy, 's-', label='Greedy-Correct Subset', linewidth=2, markersize=6, color='darkred')
+    ax2.axvline(x=layers[best_idx], color='gray', linestyle='--', alpha=0.5, linewidth=2, label=f'Best Layer ({layers[best_idx]})')
+    ax2.set_xlabel('Layer', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('K* (Perfect Knowledge)', fontsize=12, fontweight='bold')
+    ax2.set_title('K* Metric Comparison', fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=11)
+    ax2.grid(alpha=0.3)
+    ax2.set_ylim(0, 1)
+    
+    plt.tight_layout()
+    k_comp_path = output_dir / "k_metrics_comparison.png"
+    plt.savefig(k_comp_path, dpi=300, bbox_inches='tight')
+    print(f"K metrics comparison plot saved to: {k_comp_path}")
+    plt.close()
+    
+    # Plot 4: Performance Improvement (Greedy vs Full)
+    k_improvement = [g - f for f, g in zip(dev_k_full, dev_k_greedy)]
+    auc_improvement = [g - f for f, g in zip(dev_auc_full, dev_auc_greedy)]
+    acc_improvement = [g - f for f, g in zip(dev_accuracy_full, dev_accuracy_greedy)]
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(layers, k_improvement, 'o-', label='K Improvement', linewidth=2, markersize=6, color='green')
+    plt.plot(layers, auc_improvement, 's-', label='AUC Improvement', linewidth=2, markersize=6, color='blue')
+    plt.plot(layers, acc_improvement, '^-', label='Accuracy Improvement', linewidth=2, markersize=6, color='orange')
+    plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+    plt.axvline(x=layers[best_idx], color='gray', linestyle='--', alpha=0.5, linewidth=2, label=f'Best Layer ({layers[best_idx]})')
+    plt.xlabel('Layer', fontsize=12, fontweight='bold')
+    plt.ylabel('Performance Improvement', fontsize=12, fontweight='bold')
+    plt.title('Performance Improvement: Greedy-Correct vs Full Dev', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    
+    improvement_path = output_dir / "performance_improvement.png"
+    plt.savefig(improvement_path, dpi=300, bbox_inches='tight')
+    print(f"Performance improvement plot saved to: {improvement_path}")
     plt.close()
 
 
@@ -451,7 +845,7 @@ def save_probe(
     Save trained probe and scaler.
     
     Args:
-        probe: Trained logistic regression model
+        probe: Trained logistic regression classifier
         scaler: Fitted StandardScaler
         layer_idx: Layer index
         output_dir: Directory to save the models
@@ -479,7 +873,7 @@ def main():
     # Configuration
     probe_data_dir = Path("./data/probe_training_data")
     output_dir = Path("./models/probes")
-    relations = ["P40", "P50", "P176", "P264"]
+    relations = ["P40", "P50", "P176", "P264"]  # Updated to match generate_data_for_probe.py
     
     print("="*70)
     print("Linear Probe Training with Pre-Computed Hidden States")
@@ -501,6 +895,14 @@ def main():
         probe_data_dir, relations, split="dev"
     )
     
+    # Create greedy-correct dev subset
+    print("\n" + "="*70)
+    print("Creating Greedy-Correct Dev Subset")
+    print("="*70)
+    dev_hidden_states_greedy, dev_labels_greedy, dev_metadata_greedy = load_and_filter_greedy_correct_dev(
+        dev_hidden_states, dev_labels, dev_metadata, relations
+    )
+    
     # Train probes for all layers
     print("\n" + "="*70)
     print("Training Probes")
@@ -510,38 +912,81 @@ def main():
         train_labels,
         dev_hidden_states,
         dev_labels,
-        dev_metadata
+        dev_metadata,
+        dev_hidden_states_greedy,
+        dev_labels_greedy,
+        dev_metadata_greedy
     )
     
     # Print results
-    print("\n" + "="*80)
-    print("Results Summary - BALANCED EVALUATION (Paper Method)")
-    print("="*80)
-    print(f"{'Layer':<8} {'Train AUC':<12} {'Dev K (Bal)':<12} {'Dev K* (Bal)':<12} {'Dev K (Unbal)':<14} {'Dev K* (Unbal)':<14}")
-    print("-"*80)
+    print("\n" + "="*140)
+    print("Results Summary - Logistic Regression Probes (Full vs Greedy-Correct Dev Evaluation)")
+    print("="*140)
+    print(f"{'Layer':<6} {'Train':<8} {'Train':<8} {'Dev (Full)':<12} {'Dev (Full)':<12} {'Dev (Full)':<12} {'Dev (Greedy)':<14} {'Dev (Greedy)':<14} {'Dev (Greedy)':<14}")
+    print(f"{'':^6} {'AUC':<8} {'Acc':<8} {'AUC':<12} {'Acc':<12} {'K':<12} {'AUC':<14} {'Acc':<14} {'K':<14}")
+    print("-"*140)
     for metrics in all_metrics:
-        print(f"{metrics['layer']:<8} "
-              f"{metrics['train_auc']:<12.4f} "
-              f"{metrics['dev_k_balanced']:<12.4f} "
-              f"{metrics['dev_k_star_balanced']:<12.4f} "
-              f"{metrics['dev_k_unbalanced']:<14.4f} "
-              f"{metrics['dev_k_star_unbalanced']:<14.4f}")
+        print(f"{metrics['layer']:<6} "
+              f"{metrics['train_auc']:<8.3f} "
+              f"{metrics['train_accuracy']:<8.3f} "
+              f"{metrics['dev_auc_full']:<12.3f} "
+              f"{metrics['dev_accuracy_full']:<12.3f} "
+              f"{metrics['dev_k_full']:<12.3f} "
+              f"{metrics['dev_auc_greedy']:<14.3f} "
+              f"{metrics['dev_accuracy_greedy']:<14.3f} "
+              f"{metrics['dev_k_greedy']:<14.3f}")
     
     # Select best layer
-    best_layer = select_best_layer(all_metrics, criterion="dev_k")
+    best_layer = select_best_layer(all_metrics, criterion="dev_k_full")
     best_metrics = all_metrics[best_layer]
     
-    print("\n" + "="*70)
-    print(f"Best Layer: {best_layer} (selected based on balanced K)")
-    print("="*70)
-    print(f"Train AUC: {best_metrics['train_auc']:.4f}")
-    print(f"Dev K (Balanced):   {best_metrics['dev_k_balanced']:.4f}")
-    print(f"Dev K* (Balanced):  {best_metrics['dev_k_star_balanced']:.4f}")
-    print(f"Dev K (Unbalanced): {best_metrics['dev_k_unbalanced']:.4f}")
-    print(f"Dev K* (Unbalanced):{best_metrics['dev_k_star_unbalanced']:.4f}")
-    print("")
-    print("NOTE: Balanced evaluation should give results closer to paper (~0.8)")
-    print("      Unbalanced shows the effect of class imbalance (~0.5)")
+    print("\n" + "="*80)
+    print(f"Best Layer: {best_layer} (selected based on full dev K)")
+    print("="*80)
+    print(f"Train AUC:               {best_metrics['train_auc']:.4f}")
+    print(f"Train Accuracy:          {best_metrics['train_accuracy']:.4f}")
+    print("\nDev (Full Dataset):")
+    print(f"  AUC:                   {best_metrics['dev_auc_full']:.4f}")
+    print(f"  Accuracy:              {best_metrics['dev_accuracy_full']:.4f}")
+    print(f"  K:                     {best_metrics['dev_k_full']:.4f}")
+    print(f"  K*:                    {best_metrics['dev_k_star_full']:.4f}")
+    print("\nDev (Greedy-Correct Subset):")
+    print(f"  AUC:                   {best_metrics['dev_auc_greedy']:.4f}")
+    print(f"  Accuracy:              {best_metrics['dev_accuracy_greedy']:.4f}")
+    print(f"  K:                     {best_metrics['dev_k_greedy']:.4f}")
+    print(f"  K*:                    {best_metrics['dev_k_star_greedy']:.4f}")
+    
+    # Compare full vs greedy-correct dev performance
+    print("\n" + "="*80)
+    print("Experimental Analysis: Full Dev vs Greedy-Correct Dev Subset")
+    print("="*80)
+    
+    full_k_values = [m['dev_k_full'] for m in all_metrics]
+    greedy_k_values = [m['dev_k_greedy'] for m in all_metrics]
+    full_auc_values = [m['dev_auc_full'] for m in all_metrics]
+    greedy_auc_values = [m['dev_auc_greedy'] for m in all_metrics]
+    
+    avg_k_full = np.mean(full_k_values)
+    avg_k_greedy = np.mean(greedy_k_values)
+    avg_auc_full = np.mean(full_auc_values)
+    avg_auc_greedy = np.mean(greedy_auc_values)
+    
+    print(f"Average K (Full Dev):        {avg_k_full:.4f}")
+    print(f"Average K (Greedy Dev):      {avg_k_greedy:.4f}")
+    print(f"K Improvement on Greedy:     {avg_k_greedy - avg_k_full:.4f} ({((avg_k_greedy/avg_k_full - 1) * 100) if avg_k_full > 0 else 0:.1f}%)")
+    print(f"\nAverage AUC (Full Dev):      {avg_auc_full:.4f}")
+    print(f"Average AUC (Greedy Dev):    {avg_auc_greedy:.4f}")
+    print(f"AUC Improvement on Greedy:   {avg_auc_greedy - avg_auc_full:.4f} ({((avg_auc_greedy/avg_auc_full - 1) * 100) if avg_auc_full > 0 else 0:.1f}%)")
+    
+    # Check for overfitting
+    train_aucs = [m['train_auc'] for m in all_metrics]
+    overfitting_layers = sum(1 for auc in train_aucs if auc > 0.99)
+    print(f"\nOverfitting analysis:")
+    print(f"Layers with train AUC > 0.99: {overfitting_layers}/{len(all_metrics)}")
+    if overfitting_layers > 0:
+        print("Warning: Some layers show potential overfitting (train AUC > 0.99)")
+    else:
+        print("No significant overfitting detected.")
     
     # Save metrics
     output_dir.mkdir(exist_ok=True, parents=True)
@@ -553,9 +998,41 @@ def main():
     }, metrics_path)
     print(f"\nMetrics saved to: {metrics_path}")
     
-    # Plot performance
-    plot_path = output_dir / "layer_performance.png"
+    # Save plotting data for independent plot generation
+    plotting_data_path = output_dir / "plotting_data.json"
+    save_plotting_data(all_metrics, plotting_data_path)
+    
+    # Generate all plots
+    print("\n" + "="*70)
+    print("Generating Plots")
+    print("="*70)
+    
+    # Extract plotting data for use with plotting functions
+    plotting_data = {
+        "layers": [m["layer"] for m in all_metrics],
+        "train_auc": [m["train_auc"] for m in all_metrics],
+        "train_accuracy": [m["train_accuracy"] for m in all_metrics],
+        "dev_auc_full": [m["dev_auc_full"] for m in all_metrics],
+        "dev_accuracy_full": [m["dev_accuracy_full"] for m in all_metrics],
+        "dev_k_full": [m["dev_k_full"] for m in all_metrics],
+        "dev_k_star_full": [m["dev_k_star_full"] for m in all_metrics],
+        "dev_auc_greedy": [m["dev_auc_greedy"] for m in all_metrics],
+        "dev_accuracy_greedy": [m["dev_accuracy_greedy"] for m in all_metrics],
+        "dev_k_greedy": [m["dev_k_greedy"] for m in all_metrics],
+        "dev_k_star_greedy": [m["dev_k_star_greedy"] for m in all_metrics]
+    }
+    
+    # 1. Original combined plot
+    plot_path = output_dir / "layer_performance_combined.png"
     plot_layer_performance(all_metrics, plot_path)
+    
+    # 2. Full dev set only plots
+    print("Generating full dev set plots...")
+    plot_full_dev_metrics(plotting_data, output_dir)
+    
+    # 3. Full vs greedy comparison plots
+    print("Generating comparison plots...")
+    plot_full_vs_greedy_comparison(plotting_data, output_dir)
     
     # Save best probe
     best_probe, best_scaler = probes_dict[best_layer]
@@ -574,6 +1051,23 @@ def main():
     print("="*70)
     print(f"\nBest probe (layer {best_layer}) saved to: {output_dir}")
     print(f"Use this probe for internal knowledge scoring.")
+    
+    print(f"\nGenerated Plots:")
+    print(f"  - Combined overview: layer_performance_combined.png")
+    print(f"  - Full dev set only:")
+    print(f"    * accuracy_full_dev.png")
+    print(f"    * auc_full_dev.png")
+    print(f"    * k_metrics_full_dev.png")
+    print(f"  - Full vs Greedy comparison:")
+    print(f"    * accuracy_comparison.png")
+    print(f"    * auc_comparison.png")
+    print(f"    * k_metrics_comparison.png")
+    print(f"    * performance_improvement.png")
+    
+    print(f"\nPlotting data saved to: {plotting_data_path}")
+    print(f"To regenerate plots later, use:")
+    print(f"  from train_linear_probe import generate_plots_from_saved_data")
+    print(f"  generate_plots_from_saved_data(Path('{plotting_data_path}'), Path('output_directory'))")
 
 
 if __name__ == "__main__":

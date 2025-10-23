@@ -31,7 +31,7 @@ def get_messages(question:str, answer:str) -> List[Dict[str,str]]:
     return messages
 
 
-def get_p_true(model, tokenizer, question: str, answers: List[str], batch_size: int = 160) -> List[float]:
+def get_p_true(model, tokenizer, question: str, answers: List[str], batch_size: int = 100) -> List[float]:
     """
     Calculate P(True) for each proposed answer - the probability that the model
     would respond "A" (CORRECT) when asked to evaluate if the answer is correct.
@@ -82,8 +82,9 @@ def get_p_true(model, tokenizer, question: str, answers: List[str], batch_size: 
 
 def load_pipeline() -> Tuple[transformers.PreTrainedTokenizer, transformers.PreTrainedModel]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    hf_token = # INSERT TOKEN
+    model_name = "jujipotle/honest_llama3_8B_instruct"
+    from key import KEY
+    hf_token = KEY
     login(hf_token)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, trust_remote_code=True, padding_side='left')
     model = AutoModelForCausalLM.from_pretrained(
@@ -127,7 +128,7 @@ def process_one_code(code_path: Path, model, tokenizer) -> List[Dict]:
         question = entry["question"]
         answers = entry["answer_labels"]
         results = get_p_true(model, tokenizer, question, answers)
-        entry["p_true"] = results
+        entry["p_true_honest"] = results
         data[i] = entry
     return data
 
@@ -146,7 +147,7 @@ def main():
         if split != "test":
             continue
         for code in os.listdir(split_path):
-            if ("stats" not in code) and (("176" in code) or ("264" in code)):
+            if ("stats" not in code) and ("40" in code):
                 code_path = split_path / code
                 print(f"Processing {code}...")
                 data = process_one_code(code_path, model, tokenizer)
