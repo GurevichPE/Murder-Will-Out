@@ -31,6 +31,14 @@ wget https://nlp.cs.princeton.edu/projects/entity-questions/dataset.zip
 
 ## Code
 
+**IMPORTANT:** to run the code, you should have your own HuggingFace token with the access to LLaMA models. 
+
+Create the `key.py` file with the variable KEY:
+
+```python
+KEY = # your huggingface token here
+```
+
 ### Data preprocessing
 
 Code `data_preprocessing.py` prepares train (500 question), test (500 questions) and dev (500 questions). It filters all dublicates, questions with several answers, and questions where question already has part of golden answer. Also, we checked that train set does not contain questions from test set.
