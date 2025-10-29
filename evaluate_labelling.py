@@ -188,14 +188,14 @@ def evaluate_all_modes(data_path: Union[str, Path]) -> Dict[str, Dict]:
     data_path = Path(data_path)
 
     # Process only dev split
-    dev_path = data_path / "dev"
+    dev_path = data_path / "test"
     if not dev_path.exists():
         raise ValueError("Dev directory not found in data path")
 
     print("Processing dev split only...")
-    for mode_file in dev_path.glob("P*.dev.json"):
+    for mode_file in dev_path.glob("P*.test.json"):
         mode = mode_file.stem.split('.')[0]  # Extract P40, P50, etc.
-        print(f"Processing {mode} in dev...")
+        print(f"Processing {mode} in test...")
         stats = evaluate_one_code(mode_file)
         modes_stats[mode] = stats
 
